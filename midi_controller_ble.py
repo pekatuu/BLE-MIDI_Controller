@@ -134,13 +134,10 @@ class MIDIController:
             
             if self.switch_states[switch_idx]:  # Pressed
                 await self.send_midi([0x90, note, velocity])  # Note On
-                if mode == "toggle":
-                    pass  # Keep note on until next press
             else:  # Released
                 if mode == "hold":
                     await self.send_midi([0x80, note, 0])  # Note Off
-                elif mode == "toggle":
-                    await self.send_midi([0x80, note, 0])  # Note Off
+                # toggle mode: note stays on until next press
         
         elif switch_type == "cc":
             cc = bank_config["cc"]
@@ -150,21 +147,45 @@ class MIDIController:
             off_value = bank_config.get("off_value", 0)
             delay = bank_config.get("delay", 0)
             
-            if self.switch_states[switch_idx]:  # Pressed
-                await self.send_midi([0xB0, cc, on_value])  # CC On
-            else:  # Released
-                if mode == "hold" and send_off:
-                    if delay > 0:
-                        await asyncio.sleep_ms(delay)
-                    await self.send_midi([0xB0, cc, off_value])  # CC Off
-                elif mode == "toggle":
-                    # Toggle between on and off values
-                    pass
+            if mode == "hold":
+                # Hold mode: send on_value when pressed, off_value when released
+                if self.switch_states[switch_idx]:  # Pressed
+                    await self.send_midi([0xB0, cc, on_value])
+                    print(f"CC {cc}: ON ({on_value})")
+                else:  # Released
+                    if send_off:
+                        if delay > 0:
+                            await asyncio.sleep_ms(delay)
+                        await self.send_midi([0xB0, cc, off_value])
+                        print(f"CC {cc}: OFF ({off_value}) after {delay}ms")
+            
+            elif mode == "toggle":
+                # Toggle mode: alternate between on_value and off_value on each press
+                if self.switch_states[switch_idx]:  # Only on press
+                    # Check current state (we need to track this)
+                    if not hasattr(self, 'cc_toggle_states'):
+                        self.cc_toggle_states = {}
+                    
+                    key = f"{self.current_bank}_{switch_idx}"
+                    current_state = self.cc_toggle_states.get(key, False)
+                    
+                    if current_state:
+                        # Currently ON, send OFF
+                        if send_off:
+                            await self.send_midi([0xB0, cc, off_value])
+                            print(f"CC {cc}: Toggle OFF ({off_value})")
+                        self.cc_toggle_states[key] = False
+                    else:
+                        # Currently OFF, send ON
+                        await self.send_midi([0xB0, cc, on_value])
+                        print(f"CC {cc}: Toggle ON ({on_value})")
+                        self.cc_toggle_states[key] = True
         
         elif switch_type == "pc":
             pc = bank_config["pc"]
             if self.switch_states[switch_idx]:  # Only on press
                 await self.send_midi([0xC0, pc])  # Program Change
+                print(f"PC: {pc}")
     
     async def scan_switches(self):
         """Scan switches for state changes"""
