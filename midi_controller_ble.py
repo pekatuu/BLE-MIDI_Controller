@@ -707,20 +707,34 @@ class MIDIController:
             # Start advertising
             while True:
                 print("Advertising BLE MIDI...")
-                async with await aioble.advertise(
-                    250_000,
-                    name="Pico MIDI",
-                    services=[MIDI_SERVICE_UUID],
-                    appearance=0x0000,
-                ) as connection:
-                    print(f"BLE connected: {connection.device}")
-                    self.ble_connection = connection
-                    
-                    try:
-                        await connection.disconnected()
-                    finally:
-                        print("BLE disconnected")
-                        self.ble_connection = None
+                try:
+                    # Advertise with proper MIDI appearance and connectable mode
+                    # Appearance 0x0000 = Unknown, but we'll keep it simple
+                    # For Windows compatibility, we need to advertise as connectable
+                    async with await aioble.advertise(
+                        250_000,  # 250ms interval
+                        name="Pico MIDI",
+                        services=[MIDI_SERVICE_UUID],
+                        appearance=0x0000,
+                        connectable=True,
+                    ) as connection:
+                        print(f"BLE connected: {connection.device}")
+                        self.ble_connection = connection
+                        
+                        try:
+                            # Keep connection alive and handle disconnection
+                            await connection.disconnected()
+                        except Exception as e:
+                            print(f"BLE connection exception: {e}")
+                        finally:
+                            print("BLE disconnected")
+                            self.ble_connection = None
+                            # Small delay before re-advertising
+                            await asyncio.sleep(1)
+                
+                except Exception as e:
+                    print(f"BLE advertising error: {e}")
+                    await asyncio.sleep(2)
         
         except Exception as e:
             print(f"BLE setup error: {e}")

@@ -109,9 +109,26 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 2. MIDIスタジオでBluetooth設定
 3. Pico MIDIを接続
 
-### Windows
-1. Bluetooth設定でPico MIDIをペアリング
-2. DAWでBLE-MIDIデバイスとして認識
+### Windows 10/11
+**重要**: Windows 10/11では標準のBluetoothペアリングではなく、MIDI専用のアプリを使用する必要があります。
+
+#### 方法1: MIDIberry（推奨）
+1. Microsoft Storeから「MIDIberry」をインストール
+2. アプリを起動
+3. 「Pico MIDI」を検索して接続
+4. DAWでMIDIberryの仮想MIDIポートを選択
+
+#### 方法2: Bluetooth MIDI Connect
+1. [Bluetooth MIDI Connect](https://www.microsoft.com/store/productId/9NBLGGH4R5BT)をインストール
+2. アプリを起動
+3. 「Pico MIDI」を検索して接続
+
+#### 方法3: loopMIDI + BLE MIDI Driver（上級者向け）
+1. [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)をインストール
+2. BLE MIDI対応ドライバをインストール
+3. 仮想MIDIポートを作成して接続
+
+**注意**: Windows標準のBluetooth設定画面からは接続できません。必ず上記のMIDI専用アプリを使用してください。
 
 ### Android
 - MIDIに対応したアプリ（例：MIDI BLE Connect）を使用
@@ -122,6 +139,24 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 - Picoを再起動
 - デバイス側のBluetoothをOFF/ON
 - 他のBLEデバイスとの干渉を確認
+
+### Windows 11で接続できない
+**これは正常な動作です**。Windows 11の標準Bluetooth設定画面からはBLE-MIDIデバイスに接続できません。
+
+**解決方法**:
+1. MIDIberry、Bluetooth MIDI Connect等のMIDI専用アプリを使用
+2. これらのアプリがBLE-MIDIプロトコルを処理し、仮想MIDIポートとして公開します
+3. DAWではその仮想MIDIポートを選択します
+
+**理由**: 
+- BLE-MIDIは特殊なBLEプロファイルを使用
+- Windows標準のBluetoothスタックはBLE-MIDIプロファイルに対応していない
+- 専用アプリがプロトコル変換を行う必要がある
+
+### マルチエフェクターには接続できるがPCに接続できない
+- マルチエフェクター等の音楽機器はBLE-MIDIプロファイルをネイティブサポート
+- PC（特にWindows）は専用アプリが必要
+- これは仕様であり、デバイス側の問題ではありません
 
 ### WiFiに接続できない
 - トグルスイッチ0がONになっているか確認
