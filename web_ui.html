@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MIDI Controller Config</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; padding-bottom: 20px; }
+        .header { background: #333; color: white; padding: 15px; position: sticky; top: 0; z-index: 100; display: flex; justify-content: space-between; align-items: center; }
+        .header h1 { font-size: 20px; }
+        .save-btn { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 14px; }
+        .save-btn:active { background: #45a049; }
+        .container { padding: 15px; max-width: 600px; margin: 0 auto; }
+        .section { background: white; padding: 15px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .section h2 { margin-bottom: 15px; color: #333; font-size: 18px; border-bottom: 2px solid #4CAF50; padding-bottom: 5px; }
+        .section h3 { margin-bottom: 10px; color: #333; font-size: 16px; }
+        .form-group { margin-bottom: 12px; }
+        .form-group label { display: block; margin-bottom: 5px; font-size: 14px; color: #666; }
+        .form-group input, .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .radio-group { display: flex; gap: 15px; margin-bottom: 10px; flex-wrap: wrap; }
+        .radio-group label { display: flex; align-items: center; gap: 5px; font-size: 14px; }
+        .radio-group input[type="radio"] { width: auto; }
+        .message { padding: 10px; margin: 10px 0; border-radius: 5px; text-align: center; display: none; }
+        .message.success { background: #d4edda; color: #155724; }
+        .message.error { background: #f8d7da; color: #721c24; }
+        .hidden { display: none !important; }
+        .loading { opacity: 0.6; pointer-events: none; }
+        .tab-buttons { display: flex; gap: 10px; margin-bottom: 15px; }
+        .tab-btn { flex: 1; padding: 10px; background: #ddd; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; }
+        .tab-btn.active { background: #4CAF50; color: white; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>MIDI Controller</h1>
+        <button class="save-btn" onclick="saveConfig()">Save</button>
+    </div>
+    
+    <div class="container">
+        <div id="message" class="message"></div>
+        
+        <div class="section">
+            <label for="bank-select" style="font-weight: bold; margin-bottom: 5px; display: block;">Bank:</label>
+            <select id="bank-select" onchange="loadBank()">
+                <option value="0">Bank 0</option>
+                <option value="1">Bank 1</option>
+            </select>
+        </div>
+        
+        <div class="tab-buttons">
+            <button class="tab-btn active" onclick="showTab('switches')">Switches</button>
+            <button class="tab-btn" onclick="showTab('exp')">Expression</button>
+            <button class="tab-btn" onclick="showTab('common')">Common</button>
+        </div>
+        
+        <div id="tab-switches" class="tab-content">
+            <div id="switches-container"></div>
+        </div>
+        
+        <div id="tab-exp" class="tab-content hidden">
+            <div id="exp-container"></div>
+        </div>
+        
+        <div id="tab-common" class="tab-content hidden">
+            <div class="section">
+                <h2>Expression Pedal Common Settings</h2>
+                <div class="form-group">
+                    <label>Filter (0.0-1.0):</label>
+                    <input type="number" id="exp-filter" min="0" max="1" step="0.01" value="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Polling Interval (ms):</label>
+                    <input type="number" id="exp-polling" min="0" max="100" value="5">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Deadzone Min (%):</label>
+                        <input type="number" id="exp-deadzone-min" min="0" max="100" value="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Deadzone Max (%):</label>
+                        <input type="number" id="exp-deadzone-max" min="0" max="100" value="5">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let config = null;
+        let currentBank = 0;
+
+        function log(msg) {
+            console.log('[MIDI Config] ' + msg);
+        }
+
+        function showTab(tab) {
+            document.querySelectorAll('.tab-content').forEach(function(el) {
+                el.classList.add('hidden');
+            });
+            document.querySelectorAll('.tab-btn').forEach(function(btn) {
+                btn.classList.remove('active');
+            });
+            
+            document.getElementById('tab-' + tab).classList.remove('hidden');
+            event.target.classList.add('active');
+        }
+
+        async function loadConfig() {
+            log('Loading config...');
+            try {
+                const response = await fetch('/config');
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                config = await response.json();
+                log('Config loaded');
+                loadCommonSettings();
+                loadBank();
+            } catch (e) {
+                log('Failed to load config: ' + e);
+                showMessage('Failed to load config: ' + e, 'error');
+            }
+        }
+
+        function loadCommonSettings() {
+            const common = config.exp_common || {};
+            document.getElementById('exp-filter').value = common.filter || 0.1;
+            document.getElementById('exp-polling').value = common.polling || 5;
+            document.getElementById('exp-deadzone-min').value = common.deadzone_min || 5;
+            document.getElementById('exp-deadzone-max').value = common.deadzone_max || 5;
+        }
+
+        function loadBank() {
+            currentBank = parseInt(document.getElementById('bank-select').value);
+            loadSwitches();
+            loadExpressionPedals();
+        }
+
+        function loadSwitches() {
+            log('Loading switches for bank ' + currentBank);
+            const container = document.getElementById('switches-container');
+            container.innerHTML = '';
+            
+            if (!config || !config.banks || !config.banks[currentBank]) {
+                showMessage('Invalid configuration', 'error');
+                return;
+            }
+            
+            for (let i = 0; i < 8; i++) {
+                const switchConfig = config.banks[currentBank].switches[i];
+                container.innerHTML += createSwitchHTML(i, switchConfig);
+            }
+            
+            setTimeout(function() {
+                for (let i = 0; i < 8; i++) {
+                    updateSwitchFieldVisibility(i);
+                    const radios = document.querySelectorAll('input[name="type-' + i + '"]');
+                    radios.forEach(function(radio) {
+                        radio.addEventListener('change', function() {
+                            updateSwitchFieldVisibility(i);
+                        });
+                    });
+                }
+            }, 100);
+        }
+
+        function loadExpressionPedals() {
+            log('Loading expression pedals for bank ' + currentBank);
+            const container = document.getElementById('exp-container');
+            container.innerHTML = '';
+            
+            for (let i = 0; i < 2; i++) {
+                const expConfig = config.banks[currentBank].exp_pedals[i];
+                container.innerHTML += createExpHTML(i, expConfig);
+            }
+            
+            setTimeout(function() {
+                for (let i = 0; i < 2; i++) {
+                    updateExpFieldVisibility(i);
+                    const radios = document.querySelectorAll('input[name="exp-type-' + i + '"]');
+                    radios.forEach(function(radio) {
+                        radio.addEventListener('change', function() {
+                            updateExpFieldVisibility(i);
+                        });
+                    });
+                }
+            }, 100);
+        }
+
+        function createSwitchHTML(index, cfg) {
+            const noteVal = cfg.note !== undefined ? cfg.note : 60;
+            const velocityVal = cfg.velocity !== undefined ? cfg.velocity : 100;
+            const ccVal = cfg.cc !== undefined ? cfg.cc : 0;
+            const pcVal = cfg.pc !== undefined ? cfg.pc : 0;
+            const modeVal = cfg.mode || 'hold';
+            const sendOffVal = cfg.send_off ? 'checked' : '';
+            const onValueVal = cfg.on_value !== undefined ? cfg.on_value : 127;
+            const offValueVal = cfg.off_value !== undefined ? cfg.off_value : 0;
+            const delayVal = cfg.delay !== undefined ? cfg.delay : 0;
+            
+            return '<div class="section">' +
+                '<h3>Switch ' + (index + 1) + '</h3>' +
+                '<div class="radio-group">' +
+                '<label><input type="radio" name="type-' + index + '" value="note" ' + (cfg.type === 'note' ? 'checked' : '') + '> Note</label>' +
+                '<label><input type="radio" name="type-' + index + '" value="cc" ' + (cfg.type === 'cc' ? 'checked' : '') + '> CC</label>' +
+                '<label><input type="radio" name="type-' + index + '" value="pc" ' + (cfg.type === 'pc' ? 'checked' : '') + '> PC</label>' +
+                '</div>' +
+                '<div id="fields-' + index + '">' +
+                '<div class="note-fields">' +
+                '<div class="form-row">' +
+                '<div class="form-group"><label>Note (0-127):</label><input type="number" id="note-' + index + '" min="0" max="127" value="' + noteVal + '"></div>' +
+                '<div class="form-group"><label>Velocity (0-127):</label><input type="number" id="velocity-' + index + '" min="0" max="127" value="' + velocityVal + '"></div>' +
+                '</div>' +
+                '<div class="form-group"><label>Mode:</label><select id="note-mode-' + index + '">' +
+                '<option value="hold" ' + (modeVal === 'hold' ? 'selected' : '') + '>Hold</option>' +
+                '<option value="toggle" ' + (modeVal === 'toggle' ? 'selected' : '') + '>Toggle</option>' +
+                '</select></div></div>' +
+                '<div class="cc-fields">' +
+                '<div class="form-group"><label>CC No (0-127):</label><input type="number" id="cc-' + index + '" min="0" max="127" value="' + ccVal + '"></div>' +
+                '<div class="form-group"><label>Mode:</label><select id="cc-mode-' + index + '">' +
+                '<option value="hold" ' + (modeVal === 'hold' ? 'selected' : '') + '>Hold</option>' +
+                '<option value="toggle" ' + (modeVal === 'toggle' ? 'selected' : '') + '>Toggle</option>' +
+                '</select></div>' +
+                '<div class="form-group"><label><input type="checkbox" id="send-off-' + index + '" ' + sendOffVal + '> Send Off Value</label></div>' +
+                '<div class="form-row">' +
+                '<div class="form-group"><label>On Value:</label><input type="number" id="on-value-' + index + '" min="0" max="127" value="' + onValueVal + '"></div>' +
+                '<div class="form-group"><label>Off Value:</label><input type="number" id="off-value-' + index + '" min="0" max="127" value="' + offValueVal + '"></div>' +
+                '</div>' +
+                '<div class="form-group"><label>Delay (ms):</label><input type="number" id="delay-' + index + '" min="0" value="' + delayVal + '"></div>' +
+                '</div>' +
+                '<div class="pc-fields">' +
+                '<div class="form-group"><label>PC No (0-127):</label><input type="number" id="pc-' + index + '" min="0" max="127" value="' + pcVal + '"></div>' +
+                '</div></div></div>';
+        }
+
+        function createExpHTML(index, cfg) {
+            const ccVal = cfg.cc !== undefined ? cfg.cc : 11;
+            const minVal = cfg.min_value !== undefined ? cfg.min_value : (cfg.type === 'bend' ? 0 : 0);
+            const maxVal = cfg.max_value !== undefined ? cfg.max_value : (cfg.type === 'bend' ? 16383 : 127);
+            
+            return '<div class="section">' +
+                '<h3>Expression Pedal ' + (index + 1) + '</h3>' +
+                '<div class="radio-group">' +
+                '<label><input type="radio" name="exp-type-' + index + '" value="cc" ' + (cfg.type === 'cc' ? 'checked' : '') + '> CC</label>' +
+                '<label><input type="radio" name="exp-type-' + index + '" value="bend" ' + (cfg.type === 'bend' ? 'checked' : '') + '> Bend</label>' +
+                '</div>' +
+                '<div id="exp-fields-' + index + '">' +
+                '<div class="exp-cc-fields">' +
+                '<div class="form-group"><label>CC No (0-127):</label><input type="number" id="exp-cc-' + index + '" min="0" max="127" value="' + ccVal + '"></div>' +
+                '<div class="form-row">' +
+                '<div class="form-group"><label>Min Value:</label><input type="number" id="exp-cc-min-' + index + '" min="0" max="127" value="' + minVal + '"></div>' +
+                '<div class="form-group"><label>Max Value:</label><input type="number" id="exp-cc-max-' + index + '" min="0" max="127" value="' + maxVal + '"></div>' +
+                '</div></div>' +
+                '<div class="exp-bend-fields">' +
+                '<div class="form-row">' +
+                '<div class="form-group"><label>Min Value:</label><input type="number" id="exp-bend-min-' + index + '" min="0" max="16383" value="' + minVal + '"></div>' +
+                '<div class="form-group"><label>Max Value:</label><input type="number" id="exp-bend-max-' + index + '" min="0" max="16383" value="' + maxVal + '"></div>' +
+                '</div></div></div></div>';
+        }
+
+        function updateSwitchFieldVisibility(index) {
+            const typeRadio = document.querySelector('input[name="type-' + index + '"]:checked');
+            if (!typeRadio) return;
+            const type = typeRadio.value;
+            const container = document.querySelector('#fields-' + index);
+            if (!container) return;
+            
+            const noteFields = container.querySelector('.note-fields');
+            const ccFields = container.querySelector('.cc-fields');
+            const pcFields = container.querySelector('.pc-fields');
+            
+            if (noteFields) noteFields.classList.add('hidden');
+            if (ccFields) ccFields.classList.add('hidden');
+            if (pcFields) pcFields.classList.add('hidden');
+            
+            if (type === 'note' && noteFields) {
+                noteFields.classList.remove('hidden');
+            } else if (type === 'cc' && ccFields) {
+                ccFields.classList.remove('hidden');
+            } else if (type === 'pc' && pcFields) {
+                pcFields.classList.remove('hidden');
+            }
+        }
+
+        function updateExpFieldVisibility(index) {
+            const typeRadio = document.querySelector('input[name="exp-type-' + index + '"]:checked');
+            if (!typeRadio) return;
+            const type = typeRadio.value;
+            const container = document.querySelector('#exp-fields-' + index);
+            if (!container) return;
+            
+            const ccFields = container.querySelector('.exp-cc-fields');
+            const bendFields = container.querySelector('.exp-bend-fields');
+            
+            if (ccFields) ccFields.classList.add('hidden');
+            if (bendFields) bendFields.classList.add('hidden');
+            
+            if (type === 'cc' && ccFields) {
+                ccFields.classList.remove('hidden');
+            } else if (type === 'bend' && bendFields) {
+                bendFields.classList.remove('hidden');
+            }
+        }
+
+        async function saveConfig() {
+            log('Saving config...');
+            document.body.classList.add('loading');
+            
+            try {
+                // Save common settings
+                config.exp_common = {
+                    filter: parseFloat(document.getElementById('exp-filter').value),
+                    polling: parseInt(document.getElementById('exp-polling').value),
+                    deadzone_min: parseInt(document.getElementById('exp-deadzone-min').value),
+                    deadzone_max: parseInt(document.getElementById('exp-deadzone-max').value)
+                };
+                
+                // Save switches
+                for (let i = 0; i < 8; i++) {
+                    const typeRadio = document.querySelector('input[name="type-' + i + '"]:checked');
+                    if (!typeRadio) continue;
+                    
+                    const type = typeRadio.value;
+                    const switchConfig = { type: type };
+                    
+                    if (type === 'note') {
+                        switchConfig.note = parseInt(document.getElementById('note-' + i).value);
+                        switchConfig.velocity = parseInt(document.getElementById('velocity-' + i).value);
+                        switchConfig.mode = document.getElementById('note-mode-' + i).value;
+                    } else if (type === 'cc') {
+                        switchConfig.cc = parseInt(document.getElementById('cc-' + i).value);
+                        switchConfig.mode = document.getElementById('cc-mode-' + i).value;
+                        switchConfig.send_off = document.getElementById('send-off-' + i).checked;
+                        switchConfig.on_value = parseInt(document.getElementById('on-value-' + i).value);
+                        switchConfig.off_value = parseInt(document.getElementById('off-value-' + i).value);
+                        switchConfig.delay = parseInt(document.getElementById('delay-' + i).value);
+                    } else if (type === 'pc') {
+                        switchConfig.pc = parseInt(document.getElementById('pc-' + i).value);
+                    }
+                    
+                    config.banks[currentBank].switches[i] = switchConfig;
+                }
+                
+                // Save expression pedals
+                for (let i = 0; i < 2; i++) {
+                    const typeRadio = document.querySelector('input[name="exp-type-' + i + '"]:checked');
+                    if (!typeRadio) continue;
+                    
+                    const type = typeRadio.value;
+                    const expConfig = { type: type };
+                    
+                    if (type === 'cc') {
+                        expConfig.cc = parseInt(document.getElementById('exp-cc-' + i).value);
+                        expConfig.min_value = parseInt(document.getElementById('exp-cc-min-' + i).value);
+                        expConfig.max_value = parseInt(document.getElementById('exp-cc-max-' + i).value);
+                    } else if (type === 'bend') {
+                        expConfig.min_value = parseInt(document.getElementById('exp-bend-min-' + i).value);
+                        expConfig.max_value = parseInt(document.getElementById('exp-bend-max-' + i).value);
+                    }
+                    
+                    config.banks[currentBank].exp_pedals[i] = expConfig;
+                }
+                
+                log('Sending config...');
+                
+                const response = await fetch('/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    showMessage('Configuration saved!', 'success');
+                } else {
+                    showMessage('Failed to save', 'error');
+                }
+            } catch (e) {
+                log('Save error: ' + e);
+                showMessage('Error: ' + e, 'error');
+            } finally {
+                document.body.classList.remove('loading');
+            }
+        }
+
+        function showMessage(text, type) {
+            const msg = document.getElementById('message');
+            msg.textContent = text;
+            msg.className = 'message ' + type;
+            msg.style.display = 'block';
+            setTimeout(function() { 
+                msg.style.display = 'none'; 
+            }, 3000);
+        }
+
+        window.addEventListener('load', function() {
+            log('Page loaded');
+            loadConfig();
+        });
+    </script>
+</body>
+</html>

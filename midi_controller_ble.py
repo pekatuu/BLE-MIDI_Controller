@@ -8,13 +8,14 @@ import json
 import time
 import machine
 import network
-from machine import Pin
+from machine import Pin, ADC
 import aioble
 import bluetooth
 import struct
 
 # GPIO Configuration
 SWITCH_PINS = [10, 11, 17, 20, 12, 13, 14, 15]
+EXP_PINS = [26, 27]  # ADC0, ADC1
 TOGGLE_PINS = [1, 5]  # [WiFi ON/OFF, Bank Select]
 
 # BLE MIDI UUIDs
@@ -25,6 +26,74 @@ MIDI_CHAR_UUID = bluetooth.UUID("7772E5DB-3868-4112-A1A9-F2669D106BF3")
 CONFIG_FILE = "config.json"
 WIFI_SSID = "BLE-MIDI Controller"
 WIFI_PASSWORD = "testdesuyo"
+
+class ExpressionPedal:
+    """Expression pedal handler with filtering and deadzone"""
+    def __init__(self, adc_pin, config):
+        self.adc = ADC(Pin(adc_pin))
+        self.config = config
+        self.filtered_value = 0
+        self.last_sent_value = -1
+        self.raw_max = 65535  # 16-bit ADC
+    
+    def read_raw(self):
+        """Read raw ADC value"""
+        return self.adc.read_u16()
+    
+    def apply_deadzone(self, raw_value):
+        """Apply deadzone to raw ADC value"""
+        # Convert to 0-100%
+        percent = (raw_value / self.raw_max) * 100
+        
+        deadzone_min = self.config.get("deadzone_min", 5)
+        deadzone_max = self.config.get("deadzone_max", 5)
+        
+        # Apply deadzone
+        if percent < deadzone_min:
+            return 0
+        elif percent > (100 - deadzone_max):
+            return self.raw_max
+        else:
+            # Scale to full range
+            adjusted = (percent - deadzone_min) / (100 - deadzone_min - deadzone_max)
+            return int(adjusted * self.raw_max)
+    
+    def apply_filter(self, value):
+        """Apply EMA (Exponential Moving Average) filter"""
+        alpha = self.config.get("filter", 0.1)
+        self.filtered_value = alpha * value + (1 - alpha) * self.filtered_value
+        return int(self.filtered_value)
+    
+    def scale_to_range(self, value, min_val, max_val):
+        """Scale filtered value to output range"""
+        # Normalize to 0-1
+        normalized = value / self.raw_max
+        
+        # Scale to min-max range (supports inverted ranges)
+        if min_val <= max_val:
+            scaled = min_val + normalized * (max_val - min_val)
+        else:
+            # Inverted range
+            scaled = min_val - normalized * (min_val - max_val)
+        
+        return int(scaled)
+    
+    def process(self):
+        """Process ADC reading through full pipeline"""
+        raw = self.read_raw()
+        deadzone_applied = self.apply_deadzone(raw)
+        filtered = self.apply_filter(deadzone_applied)
+        return filtered
+    
+    def should_send(self, current_value):
+        """Check if value changed enough to send MIDI"""
+        if self.last_sent_value == -1:
+            return True
+        return abs(current_value - self.last_sent_value) >= 1
+    
+    def mark_sent(self, value):
+        """Mark value as sent"""
+        self.last_sent_value = value
 
 class MIDIController:
     def __init__(self):
@@ -40,6 +109,13 @@ class MIDIController:
         self.current_bank = 0
         
         self.config = self.load_config()
+        
+        # Initialize expression pedals
+        self.exp_pedals = [
+            ExpressionPedal(EXP_PINS[0], self.config.get("exp_common", {})),
+            ExpressionPedal(EXP_PINS[1], self.config.get("exp_common", {}))
+        ]
+        
         self.ble_connection = None
         self.midi_characteristic = None
         
@@ -62,6 +138,12 @@ class MIDIController:
     def default_config(self):
         """Create default configuration"""
         config = {
+            "exp_common": {
+                "filter": 0.1,
+                "polling": 5,
+                "deadzone_min": 5,
+                "deadzone_max": 5
+            },
             "banks": [
                 {
                     "switches": [
@@ -71,6 +153,19 @@ class MIDIController:
                             "velocity": 100,
                             "mode": "hold"
                         } for i in range(8)
+                    ],
+                    "exp_pedals": [
+                        {
+                            "type": "cc",
+                            "cc": 11,
+                            "min_value": 0,
+                            "max_value": 127
+                        },
+                        {
+                            "type": "bend",
+                            "min_value": 0,
+                            "max_value": 16383
+                        }
                     ]
                 },
                 {
@@ -84,6 +179,20 @@ class MIDIController:
                             "off_value": 0,
                             "delay": 0
                         } for i in range(8)
+                    ],
+                    "exp_pedals": [
+                        {
+                            "type": "cc",
+                            "cc": 1,
+                            "min_value": 0,
+                            "max_value": 127
+                        },
+                        {
+                            "type": "cc",
+                            "cc": 7,
+                            "min_value": 0,
+                            "max_value": 127
+                        }
                     ]
                 }
             ]
@@ -99,6 +208,13 @@ class MIDIController:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(config, f)
             print("Configuration saved")
+            
+            # Update expression pedal common config
+            if hasattr(self, 'exp_pedals'):
+                exp_common = config.get("exp_common", {})
+                for pedal in self.exp_pedals:
+                    pedal.config = exp_common
+            
             return True
         except Exception as e:
             print(f"Failed to save config: {e}")
@@ -118,9 +234,18 @@ class MIDIController:
                 timestamp = self.get_timestamp()
                 message = timestamp + bytes(data)
                 self.midi_characteristic.write(message, send_update=True)
-                print(f"MIDI sent: {[hex(b) for b in data]}")
+                # Reduced logging for expression pedals
+                if data[0] not in [0xB0, 0xE0]:  # Not CC or Bend
+                    print(f"MIDI sent: {[hex(b) for b in data]}")
             except Exception as e:
                 print(f"MIDI send error: {e}")
+    
+    async def send_pitch_bend(self, value):
+        """Send pitch bend message (14-bit value 0-16383)"""
+        # Pitch bend: 0xE0 + LSB + MSB
+        lsb = value & 0x7F
+        msb = (value >> 7) & 0x7F
+        await self.send_midi([0xE0, lsb, msb])
     
     async def handle_switch(self, switch_idx):
         """Handle switch press/release"""
@@ -203,6 +328,45 @@ class MIDIController:
             
             await asyncio.sleep_ms(10)
     
+    async def scan_expression_pedals(self):
+        """Scan expression pedals and send MIDI"""
+        polling_ms = self.config.get("exp_common", {}).get("polling", 5)
+        
+        while True:
+            for i, pedal in enumerate(self.exp_pedals):
+                exp_config = self.config["banks"][self.current_bank]["exp_pedals"][i]
+                exp_type = exp_config.get("type", "cc")
+                
+                # Process pedal value
+                filtered_value = pedal.process()
+                
+                if exp_type == "cc":
+                    cc_num = exp_config.get("cc", 11)
+                    min_val = exp_config.get("min_value", 0)
+                    max_val = exp_config.get("max_value", 127)
+                    
+                    # Scale to CC range
+                    cc_value = pedal.scale_to_range(filtered_value, min_val, max_val)
+                    
+                    # Send if changed
+                    if pedal.should_send(cc_value):
+                        await self.send_midi([0xB0, cc_num, cc_value])
+                        pedal.mark_sent(cc_value)
+                
+                elif exp_type == "bend":
+                    min_val = exp_config.get("min_value", 0)
+                    max_val = exp_config.get("max_value", 16383)
+                    
+                    # Scale to bend range
+                    bend_value = pedal.scale_to_range(filtered_value, min_val, max_val)
+                    
+                    # Send if changed
+                    if pedal.should_send(bend_value):
+                        await self.send_pitch_bend(bend_value)
+                        pedal.mark_sent(bend_value)
+            
+            await asyncio.sleep_ms(polling_ms)
+    
     async def scan_toggles(self):
         """Scan toggle switches"""
         last_wifi_state = self.toggles[0].value()
@@ -227,6 +391,10 @@ class MIDIController:
                 last_bank_state = bank_state
                 self.current_bank = 0 if bank_state else 1
                 print(f"Bank switched to {self.current_bank}")
+                
+                # Reset expression pedal states on bank change
+                for pedal in self.exp_pedals:
+                    pedal.last_sent_value = -1
             
             await asyncio.sleep_ms(100)
     
@@ -427,264 +595,15 @@ class MIDIController:
     
     def get_html_page(self):
         """Generate HTML configuration page"""
-        return """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MIDI Controller Config</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; background: #f5f5f5; padding-bottom: 20px; }
-        .header { background: #333; color: white; padding: 15px; position: sticky; top: 0; z-index: 100; display: flex; justify-content: space-between; align-items: center; }
-        .header h1 { font-size: 20px; }
-        .save-btn { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 14px; }
-        .save-btn:active { background: #45a049; }
-        .container { padding: 15px; max-width: 600px; margin: 0 auto; }
-        .bank-selector { background: white; padding: 15px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .bank-selector label { display: block; margin-bottom: 5px; font-weight: bold; }
-        .bank-selector select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }
-        .switch-config { background: white; padding: 15px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .switch-config h3 { margin-bottom: 10px; color: #333; font-size: 16px; }
-        .form-group { margin-bottom: 12px; }
-        .form-group label { display: block; margin-bottom: 5px; font-size: 14px; color: #666; }
-        .form-group input, .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
-        .radio-group { display: flex; gap: 15px; margin-bottom: 10px; }
-        .radio-group label { display: flex; align-items: center; gap: 5px; font-size: 14px; }
-        .radio-group input[type="radio"] { width: auto; }
-        .message { padding: 10px; margin: 10px 0; border-radius: 5px; text-align: center; display: none; }
-        .message.success { background: #d4edda; color: #155724; }
-        .message.error { background: #f8d7da; color: #721c24; }
-        .hidden { display: none !important; }
-        .loading { opacity: 0.6; pointer-events: none; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>MIDI Controller</h1>
-        <button class="save-btn" onclick="saveConfig()">Save</button>
-    </div>
-    
-    <div class="container">
-        <div id="message" class="message"></div>
-        
-        <div class="bank-selector">
-            <label for="bank-select">Bank:</label>
-            <select id="bank-select" onchange="loadBank()">
-                <option value="0">Bank 0</option>
-                <option value="1">Bank 1</option>
-            </select>
-        </div>
-        
-        <div id="switches-container"></div>
-    </div>
-
-    <script>
-        let config = null;
-        let currentBank = 0;
-
-        function log(msg) {
-            console.log('[MIDI Config] ' + msg);
-        }
-
-        async function loadConfig() {
-            log('Loading config...');
-            try {
-                const response = await fetch('/config');
-                if (!response.ok) {
-                    throw new Error('HTTP ' + response.status);
-                }
-                config = await response.json();
-                log('Config loaded: ' + JSON.stringify(config).substring(0, 100));
-                loadBank();
-            } catch (e) {
-                log('Failed to load config: ' + e);
-                showMessage('Failed to load config: ' + e, 'error');
-            }
-        }
-
-        function loadBank() {
-            log('Loading bank ' + currentBank);
-            currentBank = parseInt(document.getElementById('bank-select').value);
-            const container = document.getElementById('switches-container');
-            container.innerHTML = '';
-            
-            if (!config || !config.banks || !config.banks[currentBank]) {
-                log('Invalid config structure');
-                showMessage('Invalid configuration', 'error');
-                return;
-            }
-            
-            for (let i = 0; i < 8; i++) {
-                const switchConfig = config.banks[currentBank].switches[i];
-                container.innerHTML += createSwitchHTML(i, switchConfig);
-            }
-            
-            log('Bank loaded, adding event listeners');
-            // Add event listeners after DOM is updated
-            setTimeout(function() {
-                for (let i = 0; i < 8; i++) {
-                    updateFieldVisibility(i);
-                    const radios = document.querySelectorAll('input[name="type-' + i + '"]');
-                    radios.forEach(function(radio) {
-                        radio.addEventListener('change', function() {
-                            updateFieldVisibility(i);
-                        });
-                    });
-                }
-                log('Event listeners added');
-            }, 100);
-        }
-
-        function createSwitchHTML(index, cfg) {
-            const noteVal = cfg.note !== undefined ? cfg.note : 60;
-            const velocityVal = cfg.velocity !== undefined ? cfg.velocity : 100;
-            const ccVal = cfg.cc !== undefined ? cfg.cc : 0;
-            const pcVal = cfg.pc !== undefined ? cfg.pc : 0;
-            const modeVal = cfg.mode || 'hold';
-            const sendOffVal = cfg.send_off ? 'checked' : '';
-            const onValueVal = cfg.on_value !== undefined ? cfg.on_value : 127;
-            const offValueVal = cfg.off_value !== undefined ? cfg.off_value : 0;
-            const delayVal = cfg.delay !== undefined ? cfg.delay : 0;
-            
-            return '<div class="switch-config">' +
-                '<h3>Switch ' + (index + 1) + '</h3>' +
-                '<div class="radio-group">' +
-                '<label><input type="radio" name="type-' + index + '" value="note" ' + (cfg.type === 'note' ? 'checked' : '') + '> Note</label>' +
-                '<label><input type="radio" name="type-' + index + '" value="cc" ' + (cfg.type === 'cc' ? 'checked' : '') + '> CC</label>' +
-                '<label><input type="radio" name="type-' + index + '" value="pc" ' + (cfg.type === 'pc' ? 'checked' : '') + '> PC</label>' +
-                '</div>' +
-                '<div id="fields-' + index + '">' +
-                '<div class="note-fields">' +
-                '<div class="form-group"><label>Note (0-127):</label><input type="number" id="note-' + index + '" min="0" max="127" value="' + noteVal + '"></div>' +
-                '<div class="form-group"><label>Velocity (0-127):</label><input type="number" id="velocity-' + index + '" min="0" max="127" value="' + velocityVal + '"></div>' +
-                '<div class="form-group"><label>Mode:</label><select id="note-mode-' + index + '">' +
-                '<option value="hold" ' + (modeVal === 'hold' ? 'selected' : '') + '>Hold</option>' +
-                '<option value="toggle" ' + (modeVal === 'toggle' ? 'selected' : '') + '>Toggle</option>' +
-                '</select></div></div>' +
-                '<div class="cc-fields">' +
-                '<div class="form-group"><label>CC No (0-127):</label><input type="number" id="cc-' + index + '" min="0" max="127" value="' + ccVal + '"></div>' +
-                '<div class="form-group"><label>Mode:</label><select id="cc-mode-' + index + '">' +
-                '<option value="hold" ' + (modeVal === 'hold' ? 'selected' : '') + '>Hold</option>' +
-                '<option value="toggle" ' + (modeVal === 'toggle' ? 'selected' : '') + '>Toggle</option>' +
-                '</select></div>' +
-                '<div class="form-group"><label><input type="checkbox" id="send-off-' + index + '" ' + sendOffVal + '> Send Off Value</label></div>' +
-                '<div class="form-group"><label>On Value (0-127):</label><input type="number" id="on-value-' + index + '" min="0" max="127" value="' + onValueVal + '"></div>' +
-                '<div class="form-group"><label>Off Value (0-127):</label><input type="number" id="off-value-' + index + '" min="0" max="127" value="' + offValueVal + '"></div>' +
-                '<div class="form-group"><label>Delay (ms):</label><input type="number" id="delay-' + index + '" min="0" value="' + delayVal + '"></div>' +
-                '</div>' +
-                '<div class="pc-fields">' +
-                '<div class="form-group"><label>PC No (0-127):</label><input type="number" id="pc-' + index + '" min="0" max="127" value="' + pcVal + '"></div>' +
-                '</div></div></div>';
-        }
-
-        function updateFieldVisibility(index) {
-            const typeRadio = document.querySelector('input[name="type-' + index + '"]:checked');
-            if (!typeRadio) {
-                log('No radio selected for switch ' + index);
-                return;
-            }
-            const type = typeRadio.value;
-            const container = document.querySelector('#fields-' + index);
-            
-            if (!container) {
-                log('Container not found for switch ' + index);
-                return;
-            }
-            
-            const noteFields = container.querySelector('.note-fields');
-            const ccFields = container.querySelector('.cc-fields');
-            const pcFields = container.querySelector('.pc-fields');
-            
-            if (noteFields) noteFields.classList.add('hidden');
-            if (ccFields) ccFields.classList.add('hidden');
-            if (pcFields) pcFields.classList.add('hidden');
-            
-            if (type === 'note' && noteFields) {
-                noteFields.classList.remove('hidden');
-            } else if (type === 'cc' && ccFields) {
-                ccFields.classList.remove('hidden');
-            } else if (type === 'pc' && pcFields) {
-                pcFields.classList.remove('hidden');
-            }
-        }
-
-        async function saveConfig() {
-            log('Saving config...');
-            document.body.classList.add('loading');
-            
-            try {
-                for (let i = 0; i < 8; i++) {
-                    const typeRadio = document.querySelector('input[name="type-' + i + '"]:checked');
-                    if (!typeRadio) continue;
-                    
-                    const type = typeRadio.value;
-                    const switchConfig = { type: type };
-                    
-                    if (type === 'note') {
-                        switchConfig.note = parseInt(document.getElementById('note-' + i).value);
-                        switchConfig.velocity = parseInt(document.getElementById('velocity-' + i).value);
-                        switchConfig.mode = document.getElementById('note-mode-' + i).value;
-                    } else if (type === 'cc') {
-                        switchConfig.cc = parseInt(document.getElementById('cc-' + i).value);
-                        switchConfig.mode = document.getElementById('cc-mode-' + i).value;
-                        switchConfig.send_off = document.getElementById('send-off-' + i).checked;
-                        switchConfig.on_value = parseInt(document.getElementById('on-value-' + i).value);
-                        switchConfig.off_value = parseInt(document.getElementById('off-value-' + i).value);
-                        switchConfig.delay = parseInt(document.getElementById('delay-' + i).value);
-                    } else if (type === 'pc') {
-                        switchConfig.pc = parseInt(document.getElementById('pc-' + i).value);
-                    }
-                    
-                    config.banks[currentBank].switches[i] = switchConfig;
-                }
-                
-                log('Sending config: ' + JSON.stringify(config).substring(0, 100));
-                
-                const response = await fetch('/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(config)
-                });
-                
-                if (!response.ok) {
-                    throw new Error('HTTP ' + response.status);
-                }
-                
-                const result = await response.json();
-                log('Save result: ' + JSON.stringify(result));
-                
-                if (result.status === 'success') {
-                    showMessage('Configuration saved!', 'success');
-                } else {
-                    showMessage('Failed to save', 'error');
-                }
-            } catch (e) {
-                log('Save error: ' + e);
-                showMessage('Error: ' + e, 'error');
-            } finally {
-                document.body.classList.remove('loading');
-            }
-        }
-
-        function showMessage(text, type) {
-            const msg = document.getElementById('message');
-            msg.textContent = text;
-            msg.className = 'message ' + type;
-            msg.style.display = 'block';
-            setTimeout(function() { 
-                msg.style.display = 'none'; 
-            }, 3000);
-        }
-
-        // Start loading config when page loads
-        window.addEventListener('load', function() {
-            log('Page loaded, loading config');
-            loadConfig();
-        });
-    </script>
-</body>
-</html>"""
+        try:
+            with open('web_ui.html', 'r') as f:
+                return f.read()
+        except:
+            # Fallback to minimal HTML if file not found
+            return """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>MIDI Controller</title></head>
+<body><h1>Configuration UI file not found</h1>
+<p>Please upload web_ui.html to the device.</p></body></html>"""
     
     async def setup_ble(self):
         """Setup BLE MIDI service"""
@@ -747,6 +666,7 @@ class MIDIController:
         tasks = [
             asyncio.create_task(self.setup_ble()),
             asyncio.create_task(self.scan_switches()),
+            asyncio.create_task(self.scan_expression_pedals()),
             asyncio.create_task(self.scan_toggles()),
             asyncio.create_task(self.blink_led()),
         ]

@@ -1,10 +1,14 @@
 # BLE-MIDI Controller for Raspberry Pi Pico 2W
 
-MicroPythonで実装されたBLE-MIDIコントローラーです。8つのスイッチと2つのトグルスイッチを持ち、WiFi経由で設定を変更できます。
+MicroPythonで実装されたBLE-MIDIコントローラーです。8つのスイッチ、2つのエクスプレッションペダル入力、2つのトグルスイッチを持ち、WiFi経由で設定を変更できます。
 
 ## 機能
 
 - 8つのスイッチによるMIDI送信（Note/CC/Program Change）
+- 2つのエクスプレッションペダル入力（CC/Pitch Bend）
+  - ローパスフィルタ（EMA）によるノイズ除去
+  - デッドゾーン設定
+  - 可変ポーリングレート
 - 2つの設定バンク（トグルスイッチで切り替え）
 - WiFi AP経由のWeb設定インターフェース
 - BLE-MIDI接続
@@ -14,8 +18,10 @@ MicroPythonで実装されたBLE-MIDIコントローラーです。8つのスイ
 
 - Raspberry Pi Pico 2W
 - 8つのプッシュスイッチ（GPIO 10, 11, 17, 20, 12, 13, 14, 15）
+- 2つのエクスプレッションペダル入力（GPIO 26/ADC0, 27/ADC1）
 - 2つのトグルスイッチ（GPIO 1, 5）
 - すべてのスイッチはGNDに接続（内部プルアップ使用）
+- エクスプレッションペダルはTip=信号、Sleeve=GND
 
 ## GPIO配置
 
@@ -29,6 +35,10 @@ MicroPythonで実装されたBLE-MIDIコントローラーです。8つのスイ
 - Switch 5: GP13
 - Switch 6: GP14
 - Switch 7: GP15
+
+エクスプレッションペダル:
+- Expression 1: GP26 (ADC0)
+- Expression 2: GP27 (ADC1)
 
 トグルスイッチ:
 - Toggle 0 (WiFi ON/OFF): GP1
@@ -44,6 +54,7 @@ MicroPythonで実装されたBLE-MIDIコントローラーです。8つのスイ
 2. 必要なファイルをPicoにコピー
    ```
    midi_controller_ble.py
+   web_ui.html
    ```
 
 3. Picoを再起動
@@ -70,16 +81,21 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 ### Web設定インターフェース
 
 - バンク選択：Bank 0 / Bank 1を切り替え
-- 各スイッチの設定：
-  - タイプ選択：Note / CC / Program Change
-  - タイプに応じた詳細設定
+- タブ切り替え：
+  - **Switches**: 8つのスイッチの設定
+  - **Expression**: 2つのエクスプレッションペダルの設定
+  - **Common**: エクスプレッションペダル共通設定
 
-#### Note設定
+#### Switch設定
+- タイプ選択：Note / CC / Program Change
+- タイプに応じた詳細設定
+
+**Note設定**
 - Note (0-127): 送信するノート番号
 - Velocity (0-127): ベロシティ値
 - Mode: Hold（押している間ON）/ Toggle（押すたびにON/OFF）
 
-#### CC設定
+**CC設定**
 - CC No (0-127): コントロールチェンジ番号
 - Mode: Hold / Toggle
 - Send Off Value: OFF値を送信するか
@@ -87,8 +103,26 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 - Off Value (0-127): OFF時の値
 - Delay (ms): OFF値送信までの遅延時間
 
-#### Program Change設定
+**Program Change設定**
 - PC No (0-127): プログラムチェンジ番号
+
+#### Expression Pedal設定
+- タイプ選択：CC / Bend
+
+**CC設定**
+- CC No (0-127): コントロールチェンジ番号
+- Min Value (0-127): かかと側の値
+- Max Value (0-127): つま先側の値
+
+**Bend設定**
+- Min Value (0-16383): かかと側の値
+- Max Value (0-16383): つま先側の値
+
+#### Common設定（エクスプレッションペダル共通）
+- Filter (0.0-1.0): ローパスフィルタ係数（デフォルト0.1）
+- Polling Interval (ms): ADC読み取り間隔（デフォルト5ms）
+- Deadzone Min (%): かかと側のデッドゾーン（デフォルト5%）
+- Deadzone Max (%): つま先側のデッドゾーン（デフォルト5%）
 
 ### 設定の保存
 
@@ -173,6 +207,12 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 
 ```json
 {
+  "exp_common": {
+    "filter": 0.1,
+    "polling": 5,
+    "deadzone_min": 5,
+    "deadzone_max": 5
+  },
   "banks": [
     {
       "switches": [
@@ -195,10 +235,24 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
           "type": "pc",
           "pc": 0
         }
+      ],
+      "exp_pedals": [
+        {
+          "type": "cc",
+          "cc": 11,
+          "min_value": 0,
+          "max_value": 127
+        },
+        {
+          "type": "bend",
+          "min_value": 0,
+          "max_value": 16383
+        }
       ]
     },
     {
-      "switches": [ /* Bank 1の設定 */ ]
+      "switches": [ /* Bank 1の設定 */ ],
+      "exp_pedals": [ /* Bank 1のエクスプレッションペダル設定 */ ]
     }
   ]
 }
@@ -211,6 +265,30 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 - WiFi: AP Mode (192.168.4.1)
 - Web Server: Port 80
 - デバウンス時間: 50ms
+- ADC解像度: 16-bit (0-65535)
+- エクスプレッションペダル処理:
+  - デッドゾーン適用 → EMAフィルタ → スケーリング
+  - 変化閾値: ±1以上で送信
+
+## エクスプレッションペダルについて
+
+### 接続方法
+- ステレオジャック（TRS）を使用
+- Tip: 信号（ADC入力）
+- Ring: 未使用
+- Sleeve: GND
+
+### ノイズ対策
+- **EMAフィルタ**: 指数移動平均フィルタでノイズを除去
+  - Filter値が小さいほど滑らか（遅延大）
+  - Filter値が大きいほど応答速度が速い（ノイズ多）
+- **デッドゾーン**: ペダルの端での不安定な値を除外
+- **変化閾値**: 微小な変化では送信しない（MIDI負荷軽減）
+
+### 推奨設定
+- 一般的な用途: Filter=0.1, Polling=5ms, Deadzone=5%
+- 高速応答: Filter=0.3, Polling=3ms, Deadzone=3%
+- 滑らか重視: Filter=0.05, Polling=10ms, Deadzone=7%
 
 ## 制限事項
 
