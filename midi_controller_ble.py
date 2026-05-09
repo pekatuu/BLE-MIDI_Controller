@@ -14,8 +14,8 @@ import bluetooth
 import struct
 
 # GPIO Configuration
-SWITCH_PINS = [10, 11, 17, 20, 12, 13, 14, 15]
-EXP_PINS = [26, 27]  # ADC0, ADC1
+SWITCH_PINS = [16, 17, 18, 19, 20, 21, 14, 15]
+EXP_PINS = [26]  # ADC0, ADC1
 TOGGLE_PINS = [1, 5]  # [WiFi ON/OFF, Bank Select]
 
 # BLE MIDI UUIDs
@@ -85,11 +85,16 @@ class ExpressionPedal:
         filtered = self.apply_filter(deadzone_applied)
         return filtered
     
-    def should_send(self, current_value):
-        """Check if value changed enough to send MIDI"""
+    def should_send(self, current_value, min_val, max_val):
+        """Check if value changed enough to send MIDI (1% of range)"""
         if self.last_sent_value == -1:
             return True
-        return abs(current_value - self.last_sent_value) >= 1
+        
+        # Calculate 1% of the range
+        value_range = abs(max_val - min_val)
+        threshold = max(1, int(value_range * 0.01))  # At least 1
+        
+        return abs(current_value - self.last_sent_value) >= threshold
     
     def mark_sent(self, value):
         """Mark value as sent"""
@@ -112,8 +117,7 @@ class MIDIController:
         
         # Initialize expression pedals
         self.exp_pedals = [
-            ExpressionPedal(EXP_PINS[0], self.config.get("exp_common", {})),
-            ExpressionPedal(EXP_PINS[1], self.config.get("exp_common", {}))
+            ExpressionPedal(ep, self.config.get("exp_common", {})) for ep in EXP_PINS
         ]
         
         self.ble_connection = None
@@ -348,8 +352,8 @@ class MIDIController:
                     # Scale to CC range
                     cc_value = pedal.scale_to_range(filtered_value, min_val, max_val)
                     
-                    # Send if changed
-                    if pedal.should_send(cc_value):
+                    # Send if changed (1% of range threshold)
+                    if pedal.should_send(cc_value, min_val, max_val):
                         await self.send_midi([0xB0, cc_num, cc_value])
                         pedal.mark_sent(cc_value)
                 
@@ -360,8 +364,8 @@ class MIDIController:
                     # Scale to bend range
                     bend_value = pedal.scale_to_range(filtered_value, min_val, max_val)
                     
-                    # Send if changed
-                    if pedal.should_send(bend_value):
+                    # Send if changed (1% of range threshold)
+                    if pedal.should_send(bend_value, min_val, max_val):
                         await self.send_pitch_bend(bend_value)
                         pedal.mark_sent(bend_value)
             
