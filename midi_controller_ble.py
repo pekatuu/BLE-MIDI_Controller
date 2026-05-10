@@ -35,6 +35,8 @@ class ExpressionPedal:
         self.filtered_value = 0
         self.last_sent_value = -1
         self.raw_max = 65535  # 16-bit ADC
+        self.last_raw_value = 0
+        self.filter_initialized = False
     
     def read_raw(self):
         """Read raw ADC value"""
@@ -59,8 +61,31 @@ class ExpressionPedal:
             return int(adjusted * self.raw_max)
     
     def apply_filter(self, value):
-        """Apply EMA (Exponential Moving Average) filter"""
-        alpha = self.config.get("filter", 0.1)
+        """Apply adaptive EMA (Exponential Moving Average) filter"""
+        # Initialize filter on first call
+        if not self.filter_initialized:
+            self.filtered_value = value
+            self.filter_initialized = True
+            return value
+        
+        base_alpha = self.config.get("filter", 0.1)
+        
+        # Adaptive filtering: increase alpha (faster response) for large changes
+        diff = abs(value - self.filtered_value)
+        diff_percent = diff / self.raw_max
+        
+        # If change is > 20% of full range, jump immediately (no filter)
+        if diff_percent > 0.2:
+            self.filtered_value = value
+            return value
+        # If change is > 10% of full range, use much faster filter
+        elif diff_percent > 0.1:
+            alpha = min(1.0, base_alpha * 10)  # Up to 10x faster
+        elif diff_percent > 0.05:
+            alpha = min(1.0, base_alpha * 3)  # 3x faster
+        else:
+            alpha = base_alpha
+        
         self.filtered_value = alpha * value + (1 - alpha) * self.filtered_value
         return int(self.filtered_value)
     
@@ -81,6 +106,7 @@ class ExpressionPedal:
     def process(self):
         """Process ADC reading through full pipeline"""
         raw = self.read_raw()
+        self.last_raw_value = raw
         deadzone_applied = self.apply_deadzone(raw)
         filtered = self.apply_filter(deadzone_applied)
         return filtered
@@ -335,13 +361,24 @@ class MIDIController:
     async def scan_expression_pedals(self):
         """Scan expression pedals and send MIDI"""
         polling_ms = self.config.get("exp_common", {}).get("polling", 5)
+        last_send_time = [0, 0]  # Track last send time for each pedal
+        min_send_interval_ms = 10  # Minimum 10ms between sends (max 100 msgs/sec per pedal)
+        debug_counter = [0, 0]  # Debug: count sends per pedal
         
         while True:
+            current_time = time.ticks_ms()
+            
             for i, pedal in enumerate(self.exp_pedals):
+                # Check if enough time has passed since last send
+                time_since_last_send = time.ticks_diff(current_time, last_send_time[i])
+                if time_since_last_send < min_send_interval_ms:
+                    # Skip processing entirely during rate limit
+                    continue
+                
                 exp_config = self.config["banks"][self.current_bank]["exp_pedals"][i]
                 exp_type = exp_config.get("type", "cc")
                 
-                # Process pedal value
+                # Process pedal value ONLY when we can send
                 filtered_value = pedal.process()
                 
                 if exp_type == "cc":
@@ -356,6 +393,11 @@ class MIDIController:
                     if pedal.should_send(cc_value, min_val, max_val):
                         await self.send_midi([0xB0, cc_num, cc_value])
                         pedal.mark_sent(cc_value)
+                        last_send_time[i] = current_time
+                        debug_counter[i] += 1
+                        # Debug log every 10 sends
+                        if debug_counter[i] % 10 == 0:
+                            print(f"EXP{i} CC#{cc_num}: {cc_value} (raw:{pedal.last_raw_value}, filtered:{filtered_value})")
                 
                 elif exp_type == "bend":
                     min_val = exp_config.get("min_value", 0)
@@ -368,6 +410,11 @@ class MIDIController:
                     if pedal.should_send(bend_value, min_val, max_val):
                         await self.send_pitch_bend(bend_value)
                         pedal.mark_sent(bend_value)
+                        last_send_time[i] = current_time
+                        debug_counter[i] += 1
+                        # Debug log every 10 sends
+                        if debug_counter[i] % 10 == 0:
+                            print(f"EXP{i} Bend: {bend_value} (raw:{pedal.last_raw_value}, filtered:{filtered_value})")
             
             await asyncio.sleep_ms(polling_ms)
     
