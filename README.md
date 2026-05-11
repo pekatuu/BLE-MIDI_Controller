@@ -120,9 +120,23 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 
 #### Common設定（エクスプレッションペダル共通）
 - Filter (0.0-1.0): ローパスフィルタ係数（デフォルト0.1）
-- Polling Interval (ms): ADC読み取り間隔（デフォルト5ms）
+- Polling Interval (ms): ADC読み取り間隔（固定1ms、高速サンプリング用）
 - Deadzone Min (%): かかと側のデッドゾーン（デフォルト5%）
-- Deadzone Max (%): つま先側のデッドゾーン（デフォルト5%）
+- Deadzone Max (%): つま側のデッドゾーン（デフォルト5%）
+
+**送信設定（Send Settings）**
+- Send Mode: 送信モード
+  - **Individual（推奨）**: メッセージを1つずつ送信。互換性が高いが遅い
+  - **Batch**: 複数メッセージを1パケットで送信。高速だが一部の受信機で順序問題が発生する可能性
+- Send Interval (ms): 送信間隔（デフォルト15ms）
+  - この間隔でバッファされたメッセージを送信
+  - 小さいほど低遅延だが、受信機の負荷が増加
+- Msg Interval (ms): メッセージ間隔（Individualモードのみ、デフォルト2ms）
+  - 個別送信時のメッセージ間の遅延
+  - 受信機が追いつかない場合は増やす
+- Decimation: 間引き設定（デフォルト1）
+  - 1=全サンプル送信、2=1つおき、3=2つおき
+  - 受信機が追いつかない場合は2-3に設定してメッセージ数を削減
 
 ### 設定の保存
 
@@ -169,6 +183,31 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 
 ## トラブルシューティング
 
+### エクスプレッションペダルの受信機が追いつかない
+**症状**: ペダルを動かすと、受信側でMIDIメッセージが遅延したり、ラグが発生する
+
+**原因**: 受信機（DAW/エフェクター）がメッセージレートに追いつけない
+
+**対策**:
+1. **Send Intervalを増やす**: 15ms → 20-30msに変更
+2. **Decimationを増やす**: 1 → 2または3に変更（メッセージ数を1/2または1/3に削減）
+3. **Msg Intervalを増やす** (Individualモード): 2ms → 5-10msに変更
+4. **Send ModeをIndividualに変更**: Batchモードで問題がある場合
+
+**推奨設定例**:
+- 軽量な受信機: Send Interval=15ms, Decimation=1, Mode=Individual, Msg Interval=2ms
+- 重い受信機: Send Interval=25ms, Decimation=2, Mode=Individual, Msg Interval=5ms
+- 非常に重い受信機: Send Interval=30ms, Decimation=3, Mode=Individual, Msg Interval=10ms
+
+### エクスプレッションペダルのメッセージ順序がおかしい
+**症状**: ペダルを踏み込んだのに、最終値が正しくない、または順序が逆になる
+
+**原因**: Batchモードで一部の受信機がBLE-MIDIタイムスタンプを正しく解釈できない
+
+**対策**:
+1. **Send ModeをIndividualに変更**
+2. Msg Intervalを2-5msに設定
+
 ### BLE接続できない
 - Picoを再起動
 - デバイス側のBluetoothをOFF/ON
@@ -209,9 +248,13 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 {
   "exp_common": {
     "filter": 0.1,
-    "polling": 5,
+    "polling": 1,
     "deadzone_min": 5,
-    "deadzone_max": 5
+    "deadzone_max": 5,
+    "send_mode": "individual",
+    "send_interval": 15,
+    "msg_interval": 2,
+    "decimation": 1
   },
   "banks": [
     {
@@ -281,13 +324,80 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 - Ring: 未使用
 - Sleeve: GND
 
-### 高速サンプリングとバッチ送信
+### 高速サンプリングと送信モード
 本実装では、ワーミー（Whammy）などのリアルタイム用途に最適化された処理を採用：
 
 1. **1kHzサンプリング**: ADCを1ms周期で読み取り、EMAフィルタを適用
 2. **バッファリング**: 変化があった値をタイムスタンプ付きでバッファに蓄積
-3. **バッチ送信**: 15ms周期で、バッファ内の全メッセージを1つのBLEパケットで送信
-4. **正確なタイミング**: 各MIDIメッセージに正確なタイムスタンプを付与
+3. **送信**: 設定された間隔（デフォルト15ms）でバッファ内のメッセージを送信
+4. **2つの送信モード**:
+   - **Individualモード（推奨）**: メッセージを1つずつ送信。互換性が高い
+   - **Batchモード**: 複数メッセージを1つのBLEパケットで送信。高速だが一部の受信機で問題が発生する可能性
+
+### 送信モードの選択
+
+#### Individualモード（デフォルト、推奨）
+- **利点**: 
+  - すべての受信機で正しく動作
+  - メッセージ順序が保証される
+  - 最終値が確実に届く
+- **欠点**: 
+  - Batchモードより遅い
+  - 受信機の処理能力によっては遅延が発生
+- **推奨用途**: 
+  - 初期設定
+  - 順序が重要な用途
+  - 受信機の互換性が不明な場合
+
+#### Batchモード
+- **利点**: 
+  - 低遅延
+  - 通信効率が高い
+  - 滑らかな動作
+- **欠点**: 
+  - 一部の受信機でタイムスタンプ解釈に問題
+  - メッセージ順序が逆になる場合がある
+- **推奨用途**: 
+  - 受信機がBLE-MIDIバッチ送信に対応している場合
+  - 最低遅延が必要な場合
+  - 事前にテストして問題がないことを確認した場合
+
+### 受信機が追いつかない場合の対策
+
+受信機（DAW/エフェクター）の処理能力によっては、メッセージレートが高すぎて追いつかない場合があります。以下の設定で調整してください：
+
+1. **Send Intervalを増やす**: 15ms → 20-30ms
+   - 送信頻度を下げる
+   - 遅延は増えるが、受信機の負荷が減る
+
+2. **Decimationを増やす**: 1 → 2または3
+   - サンプルを間引いてメッセージ数を削減
+   - 2=半分、3=1/3のメッセージ数
+
+3. **Msg Intervalを増やす** (Individualモードのみ): 2ms → 5-10ms
+   - メッセージ間の遅延を増やす
+   - 受信機に処理時間を与える
+
+**設定例**:
+```
+軽量な受信機（最新DAW等）:
+  Send Mode: Individual
+  Send Interval: 15ms
+  Msg Interval: 2ms
+  Decimation: 1
+
+中程度の受信機:
+  Send Mode: Individual
+  Send Interval: 20ms
+  Msg Interval: 5ms
+  Decimation: 2
+
+重い受信機（古いエフェクター等）:
+  Send Mode: Individual
+  Send Interval: 30ms
+  Msg Interval: 10ms
+  Decimation: 3
+```
 
 ### ノイズ対策と最適化
 - **適応型EMAフィルタ**: 指数移動平均フィルタでノイズを除去
@@ -304,20 +414,27 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
   - 受信側DAW/プラグインで滑らかに補間可能
 
 ### パフォーマンス特性
-- **レイテンシ**: 最大1ms（サンプリング周期）+ 最大15ms（送信周期）= 最大16ms
-- **スループット**: 最大66メッセージ/秒/ペダル（15ms周期）
+- **レイテンシ**: 
+  - サンプリング遅延: 最大1ms
+  - 送信遅延: Send Interval設定値（デフォルト15ms）
+  - 合計: 最大16ms（デフォルト設定）
+- **スループット**: 
+  - Decimation=1: 最大66メッセージ/秒/ペダル（15ms周期）
+  - Decimation=2: 最大33メッセージ/秒/ペダル
+  - Decimation=3: 最大22メッセージ/秒/ペダル
 - **追従性**: 適応型フィルタにより、急激な操作でも即座に追従
 - **安定性**: EMAフィルタとデッドゾーンにより、ノイズを効果的に除去
 
 ### 推奨設定
-- **ワーミー用途**: Filter=0.1, Polling=1ms（固定）, Deadzone=3-5%
-- **ボリューム用途**: Filter=0.05, Deadzone=5-7%
-- **ワウペダル用途**: Filter=0.15, Deadzone=3%
+- **ワーミー用途**: Filter=0.1, Send Mode=Individual, Send Interval=15ms, Decimation=1-2
+- **ボリューム用途**: Filter=0.05, Send Interval=20ms, Decimation=2
+- **ワウペダル用途**: Filter=0.15, Send Interval=15ms, Decimation=1
 
 ### 受信側の対応
-- DAW/プラグインがBLE-MIDI複数メッセージパケットに対応している必要があります
-- 対応ソフト: Ableton Live, Logic Pro, Cubase, FL Studio等の主要DAW
-- 非対応の場合でも、最新値は正しく受信されます（中間値が欠落する可能性）
+- **Individualモード**: すべてのBLE-MIDI対応機器で動作
+- **Batchモード**: DAW/プラグインがBLE-MIDI複数メッセージパケットに対応している必要があります
+  - 対応ソフト: Ableton Live, Logic Pro, Cubase, FL Studio等の主要DAW
+  - 非対応の場合: Individualモードを使用してください
 
 ## 制限事項
 

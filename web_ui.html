@@ -18,6 +18,7 @@
         .form-group { margin-bottom: 12px; }
         .form-group label { display: block; margin-bottom: 5px; font-size: 14px; color: #666; }
         .form-group input, .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
+        .form-group small { display: block; margin-top: 3px; }
         .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .radio-group { display: flex; gap: 15px; margin-bottom: 10px; flex-wrap: wrap; }
         .radio-group label { display: flex; align-items: center; gap: 5px; font-size: 14px; }
@@ -72,7 +73,8 @@
                 </div>
                 <div class="form-group">
                     <label>Polling Interval (ms):</label>
-                    <input type="number" id="exp-polling" min="0" max="100" value="5">
+                    <input type="number" id="exp-polling" min="0" max="100" value="1">
+                    <small style="color: #666; font-size: 12px;">Fixed at 1ms for high-speed sampling</small>
                 </div>
                 <div class="form-row">
                     <div class="form-group">
@@ -83,6 +85,32 @@
                         <label>Deadzone Max (%):</label>
                         <input type="number" id="exp-deadzone-max" min="0" max="100" value="5">
                     </div>
+                </div>
+                <h3 style="margin-top: 20px; margin-bottom: 10px;">Send Settings</h3>
+                <div class="form-group">
+                    <label>Send Mode:</label>
+                    <select id="exp-send-mode">
+                        <option value="individual">Individual (Compatible)</option>
+                        <option value="batch">Batch (Fast, may have issues)</option>
+                    </select>
+                    <small style="color: #666; font-size: 12px;">Individual mode is more compatible but slower. Batch mode may cause order issues on some receivers.</small>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Send Interval (ms):</label>
+                        <input type="number" id="exp-send-interval" min="5" max="100" value="15">
+                        <small style="color: #666; font-size: 12px;">Time between sends</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Msg Interval (ms):</label>
+                        <input type="number" id="exp-msg-interval" min="0" max="20" value="2">
+                        <small style="color: #666; font-size: 12px;">Delay between messages (individual mode)</small>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Decimation:</label>
+                    <input type="number" id="exp-decimation" min="1" max="10" value="1">
+                    <small style="color: #666; font-size: 12px;">Send every Nth sample (1=all, 2=every other, 3=every third). Higher values reduce message rate.</small>
                 </div>
             </div>
         </div>
@@ -128,9 +156,13 @@
         function loadCommonSettings() {
             const common = config.exp_common || {};
             document.getElementById('exp-filter').value = common.filter || 0.1;
-            document.getElementById('exp-polling').value = common.polling || 5;
+            document.getElementById('exp-polling').value = common.polling || 1;
             document.getElementById('exp-deadzone-min').value = common.deadzone_min || 5;
             document.getElementById('exp-deadzone-max').value = common.deadzone_max || 5;
+            document.getElementById('exp-send-mode').value = common.send_mode || 'individual';
+            document.getElementById('exp-send-interval').value = common.send_interval || 15;
+            document.getElementById('exp-msg-interval').value = common.msg_interval || 2;
+            document.getElementById('exp-decimation').value = common.decimation || 1;
         }
 
         function loadBank() {
@@ -315,7 +347,11 @@
                     filter: parseFloat(document.getElementById('exp-filter').value),
                     polling: parseInt(document.getElementById('exp-polling').value),
                     deadzone_min: parseInt(document.getElementById('exp-deadzone-min').value),
-                    deadzone_max: parseInt(document.getElementById('exp-deadzone-max').value)
+                    deadzone_max: parseInt(document.getElementById('exp-deadzone-max').value),
+                    send_mode: document.getElementById('exp-send-mode').value,
+                    send_interval: parseInt(document.getElementById('exp-send-interval').value),
+                    msg_interval: parseInt(document.getElementById('exp-msg-interval').value),
+                    decimation: parseInt(document.getElementById('exp-decimation').value)
                 };
                 
                 // Save switches
