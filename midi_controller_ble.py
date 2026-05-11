@@ -28,7 +28,7 @@ WIFI_SSID = "BLE-MIDI Controller"
 WIFI_PASSWORD = "testdesuyo"
 
 class ExpressionPedal:
-    """Expression pedal handler with filtering and deadzone"""
+    """Expression pedal handler with high-speed sampling and buffering"""
     def __init__(self, adc_pin, config):
         self.adc = ADC(Pin(adc_pin))
         self.config = config
@@ -37,6 +37,18 @@ class ExpressionPedal:
         self.raw_max = 65535  # 16-bit ADC
         self.last_raw_value = 0
         self.filter_initialized = False
+        
+        # Buffering for BLE-MIDI packet batching
+        self.value_buffer = []  # [(timestamp_ms, scaled_value), ...]
+        self.max_buffer_size = 15
+        
+        # Threshold: 512 ADC counts = 1 MIDI CC step (65536/128)
+        self.adc_threshold = 512
+        self.last_sent_filtered_adc = 0
+        
+        # Debug counters
+        self.sample_count = 0
+        self.buffer_count = 0
     
     def read_raw(self):
         """Read raw ADC value"""
@@ -103,24 +115,38 @@ class ExpressionPedal:
         
         return int(scaled)
     
-    def process(self):
-        """Process ADC reading through full pipeline"""
+    def process_sample(self):
+        """Process one ADC sample (called at 1kHz)"""
         raw = self.read_raw()
         self.last_raw_value = raw
         deadzone_applied = self.apply_deadzone(raw)
         filtered = self.apply_filter(deadzone_applied)
+        self.sample_count += 1
         return filtered
     
-    def should_send(self, current_value, min_val, max_val):
-        """Check if value changed enough to send MIDI (1% of range)"""
+    def should_buffer(self, current_filtered_adc):
+        """Check if filtered ADC value changed enough to buffer (512 ADC counts threshold)"""
         if self.last_sent_value == -1:
             return True
         
-        # Calculate 1% of the range
-        value_range = abs(max_val - min_val)
-        threshold = max(1, int(value_range * 0.01))  # At least 1
+        # Compare in ADC space (filtered values)
+        if not hasattr(self, 'last_sent_filtered_adc'):
+            self.last_sent_filtered_adc = 0
         
-        return abs(current_value - self.last_sent_value) >= threshold
+        return abs(current_filtered_adc - self.last_sent_filtered_adc) >= self.adc_threshold
+    
+    def add_to_buffer(self, timestamp_ms, midi_data, filtered_adc):
+        """Add value to buffer for batched sending"""
+        if len(self.value_buffer) < self.max_buffer_size:
+            self.value_buffer.append((timestamp_ms, midi_data))
+            self.last_sent_filtered_adc = filtered_adc
+            self.buffer_count += 1
+    
+    def get_buffer_and_clear(self):
+        """Get buffered values and clear buffer"""
+        buffer = self.value_buffer.copy()
+        self.value_buffer.clear()
+        return buffer
     
     def mark_sent(self, value):
         """Mark value as sent"""
@@ -170,7 +196,7 @@ class MIDIController:
         config = {
             "exp_common": {
                 "filter": 0.1,
-                "polling": 5,
+                "polling": 1,  # Fixed at 1ms for high-speed sampling
                 "deadzone_min": 5,
                 "deadzone_max": 5
             },
@@ -251,11 +277,18 @@ class MIDIController:
             return False
     
     def get_timestamp(self):
-        """Get BLE MIDI timestamp"""
-        ms = time.ticks_ms() & 0x1FFF
+        """Get BLE MIDI timestamp (13-bit)"""
+        ms = time.ticks_ms() & 0x1FFF  # 13-bit mask
         header = 0x80 | ((ms >> 7) & 0x3F)
         timestamp = 0x80 | (ms & 0x7F)
         return bytes([header, timestamp])
+    
+    def get_timestamp_parts(self, timestamp_ms):
+        """Get BLE MIDI timestamp parts for batched messages"""
+        ms = timestamp_ms & 0x1FFF  # 13-bit mask
+        header = 0x80 | ((ms >> 7) & 0x3F)
+        timestamp_low = 0x80 | (ms & 0x7F)
+        return header, timestamp_low
     
     async def send_midi(self, data):
         """Send MIDI message via BLE"""
@@ -269,6 +302,53 @@ class MIDIController:
                     print(f"MIDI sent: {[hex(b) for b in data]}")
             except Exception as e:
                 print(f"MIDI send error: {e}")
+    
+    async def send_midi_batch(self, messages):
+        """Send multiple MIDI messages in one BLE packet with timestamps"""
+        if not self.ble_connection or not self.midi_characteristic or not messages:
+            return
+        
+        try:
+            # Build BLE-MIDI packet with multiple messages
+            packet = bytearray()
+            
+            # CRITICAL: Use CURRENT timestamp for header
+            current_ms = time.ticks_ms() & 0x1FFF
+            header = 0x80 | ((current_ms >> 7) & 0x3F)
+            packet.append(header)
+            
+            # Debug: log all MIDI values and timestamps
+            midi_values = []
+            timestamps = []
+            
+            for timestamp_ms, midi_data in messages:
+                # Use message's own timestamp
+                ts_13bit = timestamp_ms & 0x1FFF
+                timestamp_low = 0x80 | (ts_13bit & 0x7F)
+                packet.append(timestamp_low)
+                packet.extend(midi_data)
+                
+                timestamps.append(ts_13bit & 0x7F)
+                
+                # Extract MIDI value for logging
+                if len(midi_data) >= 3:
+                    if midi_data[0] == 0xB0:  # CC
+                        midi_values.append(midi_data[2])
+                    elif midi_data[0] == 0xE0:  # Bend
+                        bend_val = (midi_data[2] << 7) | midi_data[1]
+                        midi_values.append(bend_val)
+            
+            # Send batched packet
+            self.midi_characteristic.write(bytes(packet), send_update=True)
+            
+            # Debug log for verification
+            if len(messages) > 3:
+                print(f"Batch: {len(messages)} msgs [{midi_values[0]}, {midi_values[len(midi_values)//2]}, {midi_values[-1]}], ts=[{timestamps[0]}..{timestamps[-1]}]")
+            elif len(messages) > 0:
+                print(f"Batch: {len(messages)} msgs {midi_values}, ts={timestamps}")
+            
+        except Exception as e:
+            print(f"MIDI batch send error: {e}")
     
     async def send_pitch_bend(self, value):
         """Send pitch bend message (14-bit value 0-16383)"""
@@ -358,65 +438,94 @@ class MIDIController:
             
             await asyncio.sleep_ms(10)
     
-    async def scan_expression_pedals(self):
-        """Scan expression pedals and send MIDI"""
-        polling_ms = self.config.get("exp_common", {}).get("polling", 5)
-        last_send_time = [0, 0]  # Track last send time for each pedal
-        min_send_interval_ms = 10  # Minimum 10ms between sends (max 100 msgs/sec per pedal)
-        debug_counter = [0, 0]  # Debug: count sends per pedal
+    async def sample_expression_pedals(self):
+        """High-speed sampling task (1kHz) for expression pedals"""
+        while True:
+            current_time = time.ticks_ms()
+            
+            for i, pedal in enumerate(self.exp_pedals):
+                exp_config = self.config["banks"][self.current_bank]["exp_pedals"][i]
+                exp_type = exp_config.get("type", "cc")
+                
+                # Sample and filter at 1kHz
+                filtered_value = pedal.process_sample()
+                
+                # Check if change is significant (ADC threshold: 512 counts)
+                if pedal.should_buffer(filtered_value):
+                    if exp_type == "cc":
+                        min_val = exp_config.get("min_value", 0)
+                        max_val = exp_config.get("max_value", 127)
+                        cc_value = pedal.scale_to_range(filtered_value, min_val, max_val)
+                        cc_num = exp_config.get("cc", 11)
+                        
+                        # Debug: verify scaling
+                        if i == 0 and cc_value > 120:
+                            print(f"Sample: filtered={filtered_value}, cc={cc_value}, raw={pedal.last_raw_value}")
+                        
+                        pedal.add_to_buffer(current_time, (0xB0, cc_num, cc_value), filtered_value)
+                        pedal.mark_sent(cc_value)
+                    
+                    elif exp_type == "bend":
+                        min_val = exp_config.get("min_value", 0)
+                        max_val = exp_config.get("max_value", 16383)
+                        bend_value = pedal.scale_to_range(filtered_value, min_val, max_val)
+                        lsb = bend_value & 0x7F
+                        msb = (bend_value >> 7) & 0x7F
+                        pedal.add_to_buffer(current_time, (0xE0, lsb, msb), filtered_value)
+                        pedal.mark_sent(bend_value)
+            
+            await asyncio.sleep_ms(1)  # 1kHz sampling
+    
+    async def send_expression_pedals(self):
+        """Send buffered expression pedal data (15ms interval)"""
+        send_interval_ms = 15  # BLE-MIDI recommended interval
+        debug_counter = [0, 0]
+        last_debug_time = time.ticks_ms()
         
         while True:
             current_time = time.ticks_ms()
             
             for i, pedal in enumerate(self.exp_pedals):
-                # Check if enough time has passed since last send
-                time_since_last_send = time.ticks_diff(current_time, last_send_time[i])
-                if time_since_last_send < min_send_interval_ms:
-                    # Skip processing entirely during rate limit
-                    continue
+                # Get buffered values
+                buffer = pedal.get_buffer_and_clear()
                 
-                exp_config = self.config["banks"][self.current_bank]["exp_pedals"][i]
-                exp_type = exp_config.get("type", "cc")
-                
-                # Process pedal value ONLY when we can send
-                filtered_value = pedal.process()
-                
-                if exp_type == "cc":
-                    cc_num = exp_config.get("cc", 11)
-                    min_val = exp_config.get("min_value", 0)
-                    max_val = exp_config.get("max_value", 127)
+                if buffer:
+                    # WORKAROUND: Send messages individually instead of batched
+                    # Some BLE-MIDI receivers don't handle batched messages correctly
+                    for timestamp_ms, midi_data in buffer:
+                        await self.send_midi(list(midi_data))
+                        await asyncio.sleep_ms(1)  # Small delay between messages
                     
-                    # Scale to CC range
-                    cc_value = pedal.scale_to_range(filtered_value, min_val, max_val)
+                    # Debug: log last value in buffer
+                    exp_config = self.config["banks"][self.current_bank]["exp_pedals"][i]
+                    exp_type = exp_config.get("type", "cc")
+                    last_msg = buffer[-1][1]
                     
-                    # Send if changed (1% of range threshold)
-                    if pedal.should_send(cc_value, min_val, max_val):
-                        await self.send_midi([0xB0, cc_num, cc_value])
-                        pedal.mark_sent(cc_value)
-                        last_send_time[i] = current_time
-                        debug_counter[i] += 1
-                        # Debug log every 10 sends
-                        if debug_counter[i] % 10 == 0:
-                            print(f"EXP{i} CC#{cc_num}: {cc_value} (raw:{pedal.last_raw_value}, filtered:{filtered_value})")
-                
-                elif exp_type == "bend":
-                    min_val = exp_config.get("min_value", 0)
-                    max_val = exp_config.get("max_value", 16383)
+                    if exp_type == "cc":
+                        last_cc = last_msg[2]
+                        if i == 0:  # Only log pedal 0
+                            print(f"EXP{i} sent {len(buffer)} msgs individually, last CC: {last_cc} (raw:{pedal.last_raw_value}, filtered:{int(pedal.filtered_value)})")
+                    else:
+                        last_bend = (last_msg[2] << 7) | last_msg[1]
+                        if i == 0:
+                            print(f"EXP{i} sent {len(buffer)} msgs individually, last Bend: {last_bend} (raw:{pedal.last_raw_value}, filtered:{int(pedal.filtered_value)})")
                     
-                    # Scale to bend range
-                    bend_value = pedal.scale_to_range(filtered_value, min_val, max_val)
-                    
-                    # Send if changed (1% of range threshold)
-                    if pedal.should_send(bend_value, min_val, max_val):
-                        await self.send_pitch_bend(bend_value)
-                        pedal.mark_sent(bend_value)
-                        last_send_time[i] = current_time
-                        debug_counter[i] += 1
-                        # Debug log every 10 sends
-                        if debug_counter[i] % 10 == 0:
-                            print(f"EXP{i} Bend: {bend_value} (raw:{pedal.last_raw_value}, filtered:{filtered_value})")
+                    debug_counter[i] += len(buffer)
             
-            await asyncio.sleep_ms(polling_ms)
+            # Debug statistics every 5 seconds
+            if time.ticks_diff(current_time, last_debug_time) >= 5000:
+                for i, pedal in enumerate(self.exp_pedals):
+                    if pedal.sample_count > 0:
+                        buffer_rate = (pedal.buffer_count / pedal.sample_count) * 100
+                        print(f"EXP{i} stats: samples={pedal.sample_count}, buffered={pedal.buffer_count} ({buffer_rate:.1f}%), sent={debug_counter[i]}")
+                        pedal.sample_count = 0
+                        pedal.buffer_count = 0
+                        debug_counter[i] = 0
+                last_debug_time = current_time
+            
+            debug_counter[i] = 0
+            last_debug_time = current_time
+            await asyncio.sleep_ms(send_interval_ms)
     
     async def scan_toggles(self):
         """Scan toggle switches"""
@@ -443,9 +552,12 @@ class MIDIController:
                 self.current_bank = 0 if bank_state else 1
                 print(f"Bank switched to {self.current_bank}")
                 
-                # Reset expression pedal states on bank change
+                # IMPORTANT: Clear expression pedal buffers and reset state on bank change
                 for pedal in self.exp_pedals:
                     pedal.last_sent_value = -1
+                    pedal.last_sent_filtered_adc = 0
+                    pedal.value_buffer.clear()
+                    print(f"Cleared pedal buffer and state")
             
             await asyncio.sleep_ms(100)
     
@@ -717,7 +829,8 @@ class MIDIController:
         tasks = [
             asyncio.create_task(self.setup_ble()),
             asyncio.create_task(self.scan_switches()),
-            asyncio.create_task(self.scan_expression_pedals()),
+            asyncio.create_task(self.sample_expression_pedals()),  # 1kHz sampling
+            asyncio.create_task(self.send_expression_pedals()),    # 15ms batched sending
             asyncio.create_task(self.scan_toggles()),
             asyncio.create_task(self.blink_led()),
         ]
