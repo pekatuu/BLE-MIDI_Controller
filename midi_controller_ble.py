@@ -107,7 +107,7 @@ class ExpressionPedal:
     def scale_to_range(self, value, min_val, max_val):
         """Scale filtered value to output range"""
         # Normalize to 0-1
-        normalized = value / self.raw_max
+        normalized = (value - self.adc_threshold) / (self.raw_max - self.adc_threshold)
         
         # Scale to min-max range (supports inverted ranges)
         if min_val <= max_val:
