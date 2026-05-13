@@ -319,23 +319,34 @@ class MIDIController:
             # Build BLE-MIDI packet with multiple messages
             packet = bytearray()
             
-            # CRITICAL: Use CURRENT timestamp for header
-            current_ms = time.ticks_ms() & 0x1FFF
-            header = 0x80 | ((current_ms >> 7) & 0x3F)
+            # CRITICAL FIX: Use FIRST message's timestamp for header
+            # BLE-MIDI spec: header and timestamp_low must be from the SAME 13-bit timestamp
+            first_ts_13bit = messages[0][0] & 0x1FFF
+            header = 0x80 | ((first_ts_13bit >> 7) & 0x3F)
             packet.append(header)
             
             # Debug: log all MIDI values and timestamps
             midi_values = []
             timestamps = []
+            last_header_bits = first_ts_13bit >> 7
             
             for timestamp_ms, midi_data in messages:
                 # Use message's own timestamp
                 ts_13bit = timestamp_ms & 0x1FFF
+                current_header_bits = ts_13bit >> 7
+                
+                # If upper 6 bits changed, insert new header
+                if current_header_bits != last_header_bits:
+                    new_header = 0x80 | (current_header_bits & 0x3F)
+                    packet.append(new_header)
+                    last_header_bits = current_header_bits
+                
+                # Add timestamp low 7 bits
                 timestamp_low = 0x80 | (ts_13bit & 0x7F)
                 packet.append(timestamp_low)
                 packet.extend(midi_data)
                 
-                timestamps.append(ts_13bit & 0x7F)
+                timestamps.append(ts_13bit)
                 
                 # Extract MIDI value for logging
                 if len(midi_data) >= 3:
