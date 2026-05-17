@@ -327,43 +327,62 @@ class MIDIController:
             
             # Debug: log all MIDI values and timestamps
             midi_values = []
-            timestamps = []
+            timestamps_full = []
             last_header_bits = first_ts_13bit >> 7
             
             for timestamp_ms, midi_data in messages:
+                # Ensure midi_data is a tuple or list
+                if isinstance(midi_data, (tuple, list)):
+                    midi_bytes = bytes(midi_data)
+                else:
+                    midi_bytes = midi_data
+                
                 # Use message's own timestamp
                 ts_13bit = timestamp_ms & 0x1FFF
                 current_header_bits = ts_13bit >> 7
                 
-                # If upper 6 bits changed, insert new header
-                if current_header_bits != last_header_bits:
-                    new_header = 0x80 | (current_header_bits & 0x3F)
-                    packet.append(new_header)
-                    last_header_bits = current_header_bits
+                # # If upper 6 bits changed, insert new header
+                # # This handles timestamp wraparound correctly
+                # if current_header_bits != last_header_bits:
+                #     print("!!!!!!!!! insert new header !!!!!!!!")
+                #     new_header = 0x80 | (current_header_bits & 0x3F)
+                #     packet.append(new_header)
+                #     last_header_bits = current_header_bits
                 
-                # Add timestamp low 7 bits
+                # Add timestamp low 7 bits (MUST have bit 7 set)
                 timestamp_low = 0x80 | (ts_13bit & 0x7F)
                 packet.append(timestamp_low)
-                packet.extend(midi_data)
+                print(f"timestamp: {header} {timestamp_low}  ")
                 
-                timestamps.append(ts_13bit)
+                # Add MIDI data bytes (MUST NOT have bit 7 set for data bytes)
+                # Status byte (0xB0, 0xE0, etc.) DOES have bit 7 set
+                for byte in midi_bytes:
+                    packet.append(byte)
+                
+                timestamps_full.append(ts_13bit)
                 
                 # Extract MIDI value for logging
-                if len(midi_data) >= 3:
-                    if midi_data[0] == 0xB0:  # CC
-                        midi_values.append(midi_data[2])
-                    elif midi_data[0] == 0xE0:  # Bend
-                        bend_val = (midi_data[2] << 7) | midi_data[1]
+                if len(midi_bytes) >= 3:
+                    if midi_bytes[0] == 0xB0:  # CC
+                        midi_values.append(midi_bytes[2])
+                    elif midi_bytes[0] == 0xE0:  # Bend
+                        bend_val = (midi_bytes[2] << 7) | midi_bytes[1]
                         midi_values.append(bend_val)
+                
+                # Safety: limit packet size to avoid BLE MTU issues
+                if len(packet) > 100:
+                    break
             
             # Send batched packet
             self.midi_characteristic.write(bytes(packet), send_update=True)
             
-            # Debug log for verification
-            if len(messages) > 3:
-                print(f"Batch: {len(messages)} msgs [{midi_values[0]}, {midi_values[len(midi_values)//2]}, {midi_values[-1]}], ts=[{timestamps[0]}..{timestamps[-1]}]")
-            elif len(messages) > 0:
-                print(f"Batch: {len(messages)} msgs {midi_values}, ts={timestamps}")
+            # Debug log for verification with full timestamps and packet hex
+            if len(messages) > 0:
+                packet_hex = ' '.join([f'{b:02X}' for b in packet[:min(30, len(packet))]])
+                if len(packet) > 30:
+                    packet_hex += '...'
+                print(f"Batch: {len(messages)} msgs, values=[{midi_values[0] if midi_values else '?'}..{midi_values[-1] if midi_values else '?'}], ts=[{timestamps_full[0]}..{timestamps_full[-1]}]")
+                print(f"  Packet: {packet_hex}")
             
         except Exception as e:
             print(f"MIDI batch send error: {e}")
@@ -569,7 +588,7 @@ class MIDIController:
                 for i, pedal in enumerate(self.exp_pedals):
                     if pedal.sample_count > 0:
                         buffer_rate = (pedal.buffer_count / pedal.sample_count) * 100
-                        print(f"EXP{i} stats: samples={pedal.sample_count}, buffered={pedal.buffer_count} ({buffer_rate:.1f}%), sent={debug_counter[i]}")
+                        # print(f"EXP{i} stats: samples={pedal.sample_count}, buffered={pedal.buffer_count} ({buffer_rate:.1f}%), sent={debug_counter[i]}")
                         pedal.sample_count = 0
                         pedal.buffer_count = 0
                         debug_counter[i] = 0
@@ -821,8 +840,13 @@ class MIDIController:
     async def setup_ble(self):
         """Setup BLE MIDI service"""
         try:
+            print("=== BLE Setup Start ===")
+            
             # Register MIDI service
+            print(f"Creating MIDI service: {MIDI_SERVICE_UUID}")
             midi_service = aioble.Service(MIDI_SERVICE_UUID)
+            
+            print(f"Creating MIDI characteristic: {MIDI_CHAR_UUID}")
             self.midi_characteristic = aioble.Characteristic(
                 midi_service,
                 MIDI_CHAR_UUID,
@@ -832,26 +856,29 @@ class MIDIController:
                 indicate=False,
             )
             
+            print("Registering services...")
             aioble.register_services(midi_service)
             
-            print("BLE MIDI service registered")
+            print("BLE MIDI service registered successfully")
+            print("=== BLE Setup Complete ===")
             
             # Start advertising
             while True:
                 print("Advertising BLE MIDI...")
                 try:
                     # Advertise with proper MIDI appearance and connectable mode
-                    # Appearance 0x0000 = Unknown, but we'll keep it simple
-                    # For Windows compatibility, we need to advertise as connectable
+                    # Use shorter interval for better discoverability
                     async with await aioble.advertise(
-                        250_000,  # 250ms interval
+                        100_000,  # 100ms interval (faster discovery)
                         name="Pico MIDI",
                         services=[MIDI_SERVICE_UUID],
                         appearance=0x0000,
                         connectable=True,
                     ) as connection:
-                        print(f"BLE connected: {connection.device}")
+                        print(f"!!! BLE CONNECTED from: {connection.device} !!!")
                         self.ble_connection = connection
+                        
+                        print("Connection established, waiting for data...")
                         
                         try:
                             # Keep connection alive and handle disconnection
@@ -859,17 +886,21 @@ class MIDIController:
                         except Exception as e:
                             print(f"BLE connection exception: {e}")
                         finally:
-                            print("BLE disconnected")
+                            print("!!! BLE DISCONNECTED !!!")
                             self.ble_connection = None
                             # Small delay before re-advertising
                             await asyncio.sleep(1)
                 
                 except Exception as e:
                     print(f"BLE advertising error: {e}")
+                    import sys
+                    sys.print_exception(e)
                     await asyncio.sleep(2)
         
         except Exception as e:
             print(f"BLE setup error: {e}")
+            import sys
+            sys.print_exception(e)
     
     async def run(self):
         """Main run loop"""
