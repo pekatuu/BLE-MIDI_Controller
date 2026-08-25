@@ -2,25 +2,42 @@
 
 MicroPythonで実装されたBLE-MIDIコントローラーです。8つのスイッチ、2つのエクスプレッションペダル入力、2つのトグルスイッチを持ち、WiFi経由で設定を変更できます。
 
+Windows PC向けのBLE-MIDI受信ツール(`tools/ble_midi_receiver.py`)も同梱しています。
+
+## リポジトリ構成
+
+```
+MIDI_Controller_BLE/
+├── midi_controller_ble.py   # Pico 2W本体のファームウェア(MicroPython)
+├── web_ui.html              # WiFi設定用Web UI(Picoにコピー)
+├── config.json              # 動作設定(Pico上で自動生成・保存)
+├── ble_midi_receiver.py     # Windows用BLE-MIDI受信ブリッジ(後述)
+├── tools/
+│   ├── ump_forwarder.ps1    # UMP転送用PowerShellスクリプト(受信ツールが使用)
+│   └── test_ble_midi_parser.py  # BLE-MIDIパーサのユニットテスト
+├── examples/                # 参考実装(adafruit_ble_midi等)
+└── README.md
+```
+
 ## 機能
 
-- 8つのスイッチによるMIDI送信（Note/CC/Program Change）
-- 2つのエクスプレッションペダル入力（CC/Pitch Bend）
-  - ローパスフィルタ（EMA）によるノイズ除去
+- 8つのスイッチによるMIDI送信(Note/CC/Program Change)
+- 2つのエクスプレッションペダル入力(CC/Pitch Bend)
+  - ローパスフィルタ(EMA)によるノイズ除去
   - デッドゾーン設定
   - 可変ポーリングレート
-- 2つの設定バンク（トグルスイッチで切り替え）
+- 2つの設定バンク(トグルスイッチで切り替え)
 - WiFi AP経由のWeb設定インターフェース
 - BLE-MIDI接続
-- 設定の永続化（JSON形式）
+- 設定の永続化(JSON形式)
 
 ## ハードウェア要件
 
 - Raspberry Pi Pico 2W
-- 8つのプッシュスイッチ（GPIO 10, 11, 17, 20, 12, 13, 14, 15）
-- 2つのエクスプレッションペダル入力（GPIO 26/ADC0, 27/ADC1）
-- 2つのトグルスイッチ（GPIO 1, 5）
-- すべてのスイッチはGNDに接続（内部プルアップ使用）
+- 8つのプッシュスイッチ(GPIO 10, 11, 17, 20, 12, 13, 14, 15)
+- 2つのエクスプレッションペダル入力(GPIO 26/ADC0, 27/ADC1)
+- 2つのトグルスイッチ(GPIO 1, 5)
+- すべてのスイッチはGNDに接続(内部プルアップ使用)
 - エクスプレッションペダルはTip=信号、Sleeve=GND
 
 ## GPIO配置
@@ -45,7 +62,7 @@ MicroPythonで実装されたBLE-MIDIコントローラーです。8つのスイ
 - Toggle 1 (Bank Select): GP5
 ```
 
-## インストール
+## インストール(Pico側)
 
 1. MicroPythonファームウェアをPico 2Wにインストール
    - [MicroPython公式サイト](https://micropython.org/download/RPI_PICO2/)から最新版をダウンロード
@@ -69,31 +86,112 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 デバイス名: Pico MIDI
 ```
 
-### WiFi設定モード
+---
 
-1. トグルスイッチ0（GP1）をONにするとWiFi APが起動します
+# Windows受信ツール (ble_midi_receiver.py)
+
+Windows PCでPicoのBLE-MIDIメッセージを受信し、**Windows MIDI Services**の仮想MIDIポートへ転送するツールです。
+
+## 仕組み
+
+```
+Pico 2W ──BLE-MIDI──> ble_midi_receiver.py ──UMP──> Default App Loopback (A)
+                                                          │ (Windows MIDI Services内部)
+                                    DAW <── Default App Loopback (B) をMIDI入力に選択
+```
+
+- BLE-MIDIパケットをデコード(タイムスタンプ、ランニングステータス、13ビットタイムスタンプの桁上がり=ヘッダ再挿入に対応)
+- MIDI 1.0バイト列をUMP(Universal MIDI Packet)32bitワードに変換
+- PowerShellモジュール経由でDefault App Loopback (A)へ常時接続し、低遅延で転送
+
+**独自の仮想ポート作成は不要**です。Windows MIDI Servicesに標準搭載の Default App Loopback ペアを使用します。
+
+## 要件
+
+- Windows 10/11 + [Windows MIDI Services](https://www.microsoft.com/store/productId/9NB4VHN0GH86)(SDK & Toolsインストール済み)
+- [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows)(7.4以上)
+- Python 3.11+ と `bleak`
+
+```cmd
+pip install bleak
+```
+
+`ble_midi_receiver.py` 内の `PWSH_PATH`(pwsh.exeのパス)が自身の環境と一致していることを確認してください。
+
+## 使い方
+
+```cmd
+:: 自動検出(周囲のBLE-MIDIデバイスをスキャンして接続)
+python ble_midi_receiver.py
+
+:: アドレス指定
+python ble_midi_receiver.py --address AA:BB:CC:DD:EE:FF
+
+:: 生パケット表示
+python ble_midi_receiver.py --verbose
+```
+
+起動すると以下が表示されます:
+
+1. BLE-MIDIデバイスのスキャン → `Pico MIDI` を発見して接続
+2. Default App Loopback (A) へのフォワーダー起動
+3. MIDIメッセージのリアルタイム表示
+
+DAW側では **「Default App Loopback (B)」** をMIDI入力に選択してください。
+
+### 表示例
+
+```
+[14:32:05] Note On   ch1  note=60  (C4  ) vel=100  <90 3C 64>          #1 (3/s)
+[14:32:06] CC        ch1  cc#7    value=64                            #2 (1/s)
+[14:32:07] PitchBend ch1  value= 8192 ( 50.0%)                        #3 (1/s)
+```
+
+## トラブルシューティング(受信ツール)
+
+| 症状 | 対処 |
+|---|---|
+| `No BLE-MIDI device found` | Picoの電源確認。電源投入後30秒以内に実行 |
+| `Could not get GATT services: Unreachable` | Windowsの「Bluetoothとデバイス」設定に `Pico MIDI` のボンディング残骸があると接続不可。削除してからPicoを再起動 |
+| `Connected but BLE-MIDI characteristic missing` | 接続先がPicoではない(BLE機器が複数ある環境)。`--address` で明示指定するか、Pico以外のBLE機器の電源を切る |
+| フォワーダーが起動しない | pwshのパス確認 / Windows MIDI Servicesのサービス起動確認(`midi.exe service`) |
+| DAWでメッセージが届かない | DAWのMIDI入力が **Loopback (B)** 側になっているか確認。(A)側ではなく(B)側 |
+
+## パーサのユニットテスト
+
+BLE-MIDIパケットデコーダの正確性(ノート、CC、ピッチベンド、バッチ、13ビットタイムスタンプの桁上がり)を検証するテストが含まれます:
+
+```cmd
+python tools\test_ble_midi_parser.py
+```
+
+---
+
+# Picoファームウェア詳細
+
+## WiFi設定モード
+
+1. トグルスイッチ0(GP1)をONにするとWiFi APが起動します
 2. オンボードLEDが1秒ごとに点滅します
-3. スマートフォンやPCから以下のWiFiに接続：
-   - SSID: `PicoMIDI`
-   - Password: `midi1234`
+3. スマートフォンやPCから以下のWiFiに接続:
+   - SSID: `BLE-MIDI Controller`
+   - Password: `testdesuyo`
 4. ブラウザで `http://192.168.4.1` にアクセス
 
 ### Web設定インターフェース
 
-- バンク選択：Bank 0 / Bank 1を切り替え
-- タブ切り替え：
+- タブ切り替え:
   - **Switches**: 8つのスイッチの設定
   - **Expression**: 2つのエクスプレッションペダルの設定
   - **Common**: エクスプレッションペダル共通設定
 
 #### Switch設定
-- タイプ選択：Note / CC / Program Change
-- タイプに応じた詳細設定
+- タイプ選択:Note / CC / Program Change
 
 **Note設定**
 - Note (0-127): 送信するノート番号
 - Velocity (0-127): ベロシティ値
-- Mode: Hold（押している間ON）/ Toggle（押すたびにON/OFF）
+- Mode: Hold(押している間ON)/ Toggle(押すたびにON/OFF)
 
 **CC設定**
 - CC No (0-127): コントロールチェンジ番号
@@ -103,151 +201,70 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
 - Off Value (0-127): OFF時の値
 - Delay (ms): OFF値送信までの遅延時間
 
-**Program Change設定**
-- PC No (0-127): プログラムチェンジ番号
-
 #### Expression Pedal設定
-- タイプ選択：CC / Bend
+- タイプ選択:CC / Bend
+- Min Value / Max Value(逆転設定でペダル方向を反転可能)
 
-**CC設定**
-- CC No (0-127): コントロールチェンジ番号
-- Min Value (0-127): かかと側の値
-- Max Value (0-127): つま先側の値
-
-**Bend設定**
-- Min Value (0-16383): かかと側の値
-- Max Value (0-16383): つま先側の値
-
-#### Common設定（エクスプレッションペダル共通）
-- Filter (0.0-1.0): ローパスフィルタ係数（デフォルト0.1）
-- Polling Interval (ms): ADC読み取り間隔（固定1ms、高速サンプリング用）
-- Deadzone Min (%): かかと側のデッドゾーン（デフォルト5%）
-- Deadzone Max (%): つま側のデッドゾーン（デフォルト5%）
-
-**送信設定（Send Settings）**
-- Send Mode: 送信モード
-  - **Individual（推奨）**: メッセージを1つずつ送信。互換性が高いが遅い
-  - **Batch**: 複数メッセージを1パケットで送信。高速だが一部の受信機で順序問題が発生する可能性
-- Send Interval (ms): 送信間隔（デフォルト15ms）
-  - この間隔でバッファされたメッセージを送信
-  - 小さいほど低遅延だが、受信機の負荷が増加
-- Msg Interval (ms): メッセージ間隔（Individualモードのみ、デフォルト2ms）
-  - 個別送信時のメッセージ間の遅延
-  - 受信機が追いつかない場合は増やす
-- Decimation: 間引き設定（デフォルト1）
-  - 1=全サンプル送信、2=1つおき、3=2つおき
-  - 受信機が追いつかない場合は2-3に設定してメッセージ数を削減
+#### Common設定(エクスプレッションペダル共通)
+- Filter (0.0-1.0): ローパスフィルタ係数(デフォルト0.1)
+- Deadzone Min/Max (%): デッドゾーン(デフォルト5%)
+- Send Mode: Individual(推奨)/ Batch
+- Send Interval (ms): 送信間隔(デフォルト15ms)
+- Msg Interval (ms): メッセージ間隔(Individualモードのみ)
+- Decimation: 間引き設定
 
 ### 設定の保存
 
-1. Web画面で設定を変更
-2. 右上の「Save」ボタンをクリック
-3. 成功メッセージが表示されます
-4. 設定は `config.json` に保存され、再起動後も保持されます
+Web画面右上の「Save」ボタンで `config.json` に保存され、再起動後も保持されます。
 
-## BLE-MIDI接続
+## BLE-MIDI接続(iOS / macOS / Android)
 
 ### iOS/iPadOS
-1. 設定 > Bluetooth でPico MIDIを検索
-2. ペアリング
-3. DAWやMIDIアプリで「Pico MIDI」を選択
+1. 設定 > Bluetooth でPico MIDIを検索・接続
+2. DAWやMIDIアプリで「Pico MIDI」を選択
 
 ### macOS
-1. Audio MIDI設定を開く
-2. MIDIスタジオでBluetooth設定
-3. Pico MIDIを接続
-
-### Windows 10/11
-**重要**: Windows 10/11では標準のBluetoothペアリングではなく、MIDI専用のアプリを使用する必要があります。
-
-#### 方法1: MIDIberry（推奨）
-1. Microsoft Storeから「MIDIberry」をインストール
-2. アプリを起動
-3. 「Pico MIDI」を検索して接続
-4. DAWでMIDIberryの仮想MIDIポートを選択
-
-#### 方法2: Bluetooth MIDI Connect
-1. [Bluetooth MIDI Connect](https://www.microsoft.com/store/productId/9NBLGGH4R5BT)をインストール
-2. アプリを起動
-3. 「Pico MIDI」を検索して接続
-
-#### 方法3: loopMIDI + BLE MIDI Driver（上級者向け）
-1. [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)をインストール
-2. BLE MIDI対応ドライバをインストール
-3. 仮想MIDIポートを作成して接続
-
-**注意**: Windows標準のBluetooth設定画面からは接続できません。必ず上記のMIDI専用アプリを使用してください。
+Audio MIDI設定 > MIDIスタジオ > Bluetooth から接続
 
 ### Android
-- MIDIに対応したアプリ（例：MIDI BLE Connect）を使用
+MIDI BLE Connect等の対応アプリを使用
 
-## トラブルシューティング
+> **Windowsの場合**は本リポジトリ同梱の `ble_midi_receiver.py` を推奨します(前述)。MIDIberry等の専用アプリでも接続可能ですが、本ツールは追加インストール不要でWindows MIDI Servicesネイティブの低遅延経路を使えます。
 
-### エクスプレッションペダルの受信機が追いつかない
-**症状**: ペダルを動かすと、受信側でMIDIメッセージが遅延したり、ラグが発生する
+## エクスプレッションペダルのチューニング
 
-**原因**: 受信機（DAW/エフェクター）がメッセージレートに追いつけない
+受信機が追いつかない場合は Web UI または `config.json` で調整:
 
-**対策**:
-1. **Send Intervalを増やす**: 15ms → 20-30msに変更
-2. **Decimationを増やす**: 1 → 2または3に変更（メッセージ数を1/2または1/3に削減）
-3. **Msg Intervalを増やす** (Individualモード): 2ms → 5-10msに変更
-4. **Send ModeをIndividualに変更**: Batchモードで問題がある場合
+| 受信機 | Send Mode | Send Interval | Msg Interval | Decimation |
+|---|---|---|---|---|
+| 軽量(最新DAW等) | Individual | 15ms | 2ms | 1 |
+| 中程度 | Individual | 20ms | 5ms | 2 |
+| 重い(古い機材等) | Individual | 30ms | 10ms | 3 |
 
-**推奨設定例**:
-- 軽量な受信機: Send Interval=15ms, Decimation=1, Mode=Individual, Msg Interval=2ms
-- 重い受信機: Send Interval=25ms, Decimation=2, Mode=Individual, Msg Interval=5ms
-- 非常に重い受信機: Send Interval=30ms, Decimation=3, Mode=Individual, Msg Interval=10ms
+- **Batchモード**は低遅延ですが、一部の受信機でタイムスタンプ解釈の問題が発生する可能性があります。問題が出たらIndividualへ戻してください
+- ファームウェア v最新では、Batchモードの13ビットタイムスタンプが8192を跨ぐ際にヘッダを再挿入する修正済みです(spec準拠)
 
-### エクスプレッションペダルのメッセージ順序がおかしい
-**症状**: ペダルを踏み込んだのに、最終値が正しくない、または順序が逆になる
+## 技術仕様
 
-**原因**: Batchモードで一部の受信機がBLE-MIDIタイムスタンプを正しく解釈できない
-
-**対策**:
-1. **Send ModeをIndividualに変更**
-2. Msg Intervalを2-5msに設定
-
-### BLE接続できない
-- Picoを再起動
-- デバイス側のBluetoothをOFF/ON
-- 他のBLEデバイスとの干渉を確認
-
-### Windows 11で接続できない
-**これは正常な動作です**。Windows 11の標準Bluetooth設定画面からはBLE-MIDIデバイスに接続できません。
-
-**解決方法**:
-1. MIDIberry、Bluetooth MIDI Connect等のMIDI専用アプリを使用
-2. これらのアプリがBLE-MIDIプロトコルを処理し、仮想MIDIポートとして公開します
-3. DAWではその仮想MIDIポートを選択します
-
-**理由**: 
-- BLE-MIDIは特殊なBLEプロファイルを使用
-- Windows標準のBluetoothスタックはBLE-MIDIプロファイルに対応していない
-- 専用アプリがプロトコル変換を行う必要がある
-
-### マルチエフェクターには接続できるがPCに接続できない
-- マルチエフェクター等の音楽機器はBLE-MIDIプロファイルをネイティブサポート
-- PC（特にWindows）は専用アプリが必要
-- これは仕様であり、デバイス側の問題ではありません
-
-### WiFiに接続できない
-- トグルスイッチ0がONになっているか確認
-- LEDが点滅しているか確認
-- WiFi設定をリセット（SSID/パスワードを確認）
-
-### 設定が保存されない
-- config.jsonファイルの書き込み権限を確認
-- シリアルコンソールでエラーメッセージを確認
+- BLE MIDI Service UUID: `03B80E5A-EDE8-4B33-A751-6CE34EC4C700`
+- BLE MIDI Characteristic UUID: `7772E5DB-3868-4112-A1A9-F2669D106BF3`
+- WiFi: AP Mode (192.168.4.1)、Web Server Port 80
+- デバウンス時間: 50ms
+- ADC解像度: 16-bit (0-65535)
+- エクスプレッションペダル処理:
+  - 高速サンプリング: 1kHz (1ms周期)
+  - 変化閾値: ADC 512カウント = MIDI CC 1ステップ
+  - 適応型フィルタ: 急激な変化時は応答速度を自動的に向上
+  - BLE-MIDIパケット: 最大15メッセージ/パケット、各メッセージに正確なタイムスタンプ
 
 ## 設定ファイル形式
 
-`config.json` の構造：
+`config.json` の構造:
 
 ```json
 {
   "exp_common": {
-    "filter": 0.1,
+    "filter": 0.3,
     "polling": 1,
     "deadzone_min": 5,
     "deadzone_max": 5,
@@ -259,195 +276,19 @@ Picoに電源を投入すると自動的にBLE-MIDIデバイスとして起動�
   "banks": [
     {
       "switches": [
-        {
-          "type": "note",
-          "note": 60,
-          "velocity": 100,
-          "mode": "hold"
-        },
-        {
-          "type": "cc",
-          "cc": 1,
-          "mode": "toggle",
-          "send_off": true,
-          "on_value": 127,
-          "off_value": 0,
-          "delay": 0
-        },
-        {
-          "type": "pc",
-          "pc": 0
-        }
+        { "type": "note", "note": 60, "velocity": 100, "mode": "hold" },
+        { "type": "cc", "cc": 1, "mode": "toggle", "send_off": true,
+          "on_value": 127, "off_value": 0, "delay": 0 },
+        { "type": "pc", "pc": 0 }
       ],
       "exp_pedals": [
-        {
-          "type": "cc",
-          "cc": 11,
-          "min_value": 0,
-          "max_value": 127
-        },
-        {
-          "type": "bend",
-          "min_value": 0,
-          "max_value": 16383
-        }
+        { "type": "cc", "cc": 11, "min_value": 0, "max_value": 127 },
+        { "type": "bend", "min_value": 0, "max_value": 16383 }
       ]
-    },
-    {
-      "switches": [ /* Bank 1の設定 */ ],
-      "exp_pedals": [ /* Bank 1のエクスプレッションペダル設定 */ ]
     }
   ]
 }
 ```
 
-## 技術仕様
-
-- BLE MIDI Service UUID: `03B80E5A-EDE8-4B33-A751-6CE34EC4C700`
-- BLE MIDI Characteristic UUID: `7772E5DB-3868-4112-A1A9-F2669D106BF3`
-- WiFi: AP Mode (192.168.4.1)
-- Web Server: Port 80
-- デバウンス時間: 50ms
-- ADC解像度: 16-bit (0-65535)
-- エクスプレッションペダル処理:
-  - **高速サンプリング**: 1kHz (1ms周期)
-  - **バッチ送信**: 15ms周期で複数メッセージを1パケットに集約
-  - **変化閾値**: ADC 512カウント = MIDI CC 1ステップ
-  - **適応型フィルタ**: 急激な変化時は応答速度を自動的に向上
-  - **BLE-MIDIパケット**: 最大15メッセージ/パケット、各メッセージに正確なタイムスタンプ
-
-## エクスプレッションペダルについて
-
-### 接続方法
-- ステレオジャック（TRS）を使用
-- Tip: 信号（ADC入力）
-- Ring: 未使用
-- Sleeve: GND
-
-### 高速サンプリングと送信モード
-本実装では、ワーミー（Whammy）などのリアルタイム用途に最適化された処理を採用：
-
-1. **1kHzサンプリング**: ADCを1ms周期で読み取り、EMAフィルタを適用
-2. **バッファリング**: 変化があった値をタイムスタンプ付きでバッファに蓄積
-3. **送信**: 設定された間隔（デフォルト15ms）でバッファ内のメッセージを送信
-4. **2つの送信モード**:
-   - **Individualモード（推奨）**: メッセージを1つずつ送信。互換性が高い
-   - **Batchモード**: 複数メッセージを1つのBLEパケットで送信。高速だが一部の受信機で問題が発生する可能性
-
-### 送信モードの選択
-
-#### Individualモード（デフォルト、推奨）
-- **利点**: 
-  - すべての受信機で正しく動作
-  - メッセージ順序が保証される
-  - 最終値が確実に届く
-- **欠点**: 
-  - Batchモードより遅い
-  - 受信機の処理能力によっては遅延が発生
-- **推奨用途**: 
-  - 初期設定
-  - 順序が重要な用途
-  - 受信機の互換性が不明な場合
-
-#### Batchモード
-- **利点**: 
-  - 低遅延
-  - 通信効率が高い
-  - 滑らかな動作
-- **欠点**: 
-  - 一部の受信機でタイムスタンプ解釈に問題
-  - メッセージ順序が逆になる場合がある
-- **推奨用途**: 
-  - 受信機がBLE-MIDIバッチ送信に対応している場合
-  - 最低遅延が必要な場合
-  - 事前にテストして問題がないことを確認した場合
-
-### 受信機が追いつかない場合の対策
-
-受信機（DAW/エフェクター）の処理能力によっては、メッセージレートが高すぎて追いつかない場合があります。以下の設定で調整してください：
-
-1. **Send Intervalを増やす**: 15ms → 20-30ms
-   - 送信頻度を下げる
-   - 遅延は増えるが、受信機の負荷が減る
-
-2. **Decimationを増やす**: 1 → 2または3
-   - サンプルを間引いてメッセージ数を削減
-   - 2=半分、3=1/3のメッセージ数
-
-3. **Msg Intervalを増やす** (Individualモードのみ): 2ms → 5-10ms
-   - メッセージ間の遅延を増やす
-   - 受信機に処理時間を与える
-
-**設定例**:
-```
-軽量な受信機（最新DAW等）:
-  Send Mode: Individual
-  Send Interval: 15ms
-  Msg Interval: 2ms
-  Decimation: 1
-
-中程度の受信機:
-  Send Mode: Individual
-  Send Interval: 20ms
-  Msg Interval: 5ms
-  Decimation: 2
-
-重い受信機（古いエフェクター等）:
-  Send Mode: Individual
-  Send Interval: 30ms
-  Msg Interval: 10ms
-  Decimation: 3
-```
-
-### ノイズ対策と最適化
-- **適応型EMAフィルタ**: 指数移動平均フィルタでノイズを除去
-  - Filter値が小さいほど滑らか（遅延大）
-  - Filter値が大きいほど応答速度が速い（ノイズ多）
-  - **適応機能**: 急激な変化（20%以上）を検出すると自動的にフィルタをバイパス
-  - 中程度の変化（5-20%）では応答速度を3-10倍に向上
-- **デッドゾーン**: ペダルの端での不安定な値を除外
-- **変化閾値**: ADC 512カウント（MIDI CC 1ステップ相当）以上の変化で送信
-  - 16bit ADC (65536) ÷ 7bit MIDI CC (128) = 512カウント/ステップ
-  - 意味のある変化のみを送信し、無駄な通信を削減
-- **BLE-MIDIバッチ送信**: 1パケットに最大15メッセージを集約
-  - 通信オーバーヘッドを削減
-  - 受信側DAW/プラグインで滑らかに補間可能
-
-### パフォーマンス特性
-- **レイテンシ**: 
-  - サンプリング遅延: 最大1ms
-  - 送信遅延: Send Interval設定値（デフォルト15ms）
-  - 合計: 最大16ms（デフォルト設定）
-- **スループット**: 
-  - Decimation=1: 最大66メッセージ/秒/ペダル（15ms周期）
-  - Decimation=2: 最大33メッセージ/秒/ペダル
-  - Decimation=3: 最大22メッセージ/秒/ペダル
-- **追従性**: 適応型フィルタにより、急激な操作でも即座に追従
-- **安定性**: EMAフィルタとデッドゾーンにより、ノイズを効果的に除去
-
-### 推奨設定
-- **ワーミー用途**: Filter=0.1, Send Mode=Individual, Send Interval=15ms, Decimation=1-2
-- **ボリューム用途**: Filter=0.05, Send Interval=20ms, Decimation=2
-- **ワウペダル用途**: Filter=0.15, Send Interval=15ms, Decimation=1
-
-### 受信側の対応
-- **Individualモード**: すべてのBLE-MIDI対応機器で動作
-- **Batchモード**: DAW/プラグインがBLE-MIDI複数メッセージパケットに対応している必要があります
-  - 対応ソフト: Ableton Live, Logic Pro, Cubase, FL Studio等の主要DAW
-  - 非対応の場合: Individualモードを使用してください
-
-## 制限事項
-
-- WiFiとBLEの同時使用により、パフォーマンスが若干低下する可能性があります
-- BLE-MIDIの遅延は通常10-20ms程度です
-- 同時に接続できるBLEデバイスは1台のみです
-
 ## ライセンス
-
-MIT License
-
-## 参考
-
-- [MicroPython公式ドキュメント](https://docs.micropython.org/)
-- [BLE-MIDI仕様](https://www.midi.org/specifications/midi-transports-specifications/bluetooth-le-midi)
-- [Raspberry Pi Pico 2W](https://www.raspberrypi.com/documentation/microcontrollers/raspberry-pi-pico.html)
+examples/ を除き MIT License
