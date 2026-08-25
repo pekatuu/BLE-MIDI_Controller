@@ -341,13 +341,12 @@ class MIDIController:
                 ts_13bit = timestamp_ms & 0x1FFF
                 current_header_bits = ts_13bit >> 7
                 
-                # # If upper 6 bits changed, insert new header
-                # # This handles timestamp wraparound correctly
-                # if current_header_bits != last_header_bits:
-                #     print("!!!!!!!!! insert new header !!!!!!!!")
-                #     new_header = 0x80 | (current_header_bits & 0x3F)
-                #     packet.append(new_header)
-                #     last_header_bits = current_header_bits
+                # If upper 6 bits changed, insert new header
+                # This handles 13-bit timestamp wraparound correctly
+                if current_header_bits != last_header_bits:
+                    new_header = 0x80 | (current_header_bits & 0x3F)
+                    packet.append(new_header)
+                    last_header_bits = current_header_bits
                 
                 # Add timestamp low 7 bits (MUST have bit 7 set)
                 timestamp_low = 0x80 | (ts_13bit & 0x7F)
