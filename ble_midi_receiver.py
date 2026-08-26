@@ -154,17 +154,36 @@ def midi1_to_ump(msg):
 # ============================================================================
 
 class MidiParser:
-    """BLE-MIDI 1.0 decoder.
+    """BLE-MIDI 1.0 decoder with timestamp recovery.
 
     Packet layout per the MIDI-BLE 1.0 spec:
         [timestampHeader] ([timestampLow] midi-message)* ...
     A new timestampHeader byte appears whenever the high 6 bits of the
     13-bit timestamp change within a packet. Running status is permitted.
+
+    The 13-bit timestamps of all messages are recovered (with wrap
+    unwrapping) and passed to the callback as (timestamp_ms, msg).
+    timestamp_ms is a monotonically increasing millisecond count since the
+    first message ever decoded (it may exceed 8192; only deltas matter).
     """
 
+    WRAP = 0x1FFF + 1                  # 8192
+
     def __init__(self, on_message):
-        self.on_message = on_message      # callback(list_of_bytes)
-        self.last_high = None
+        self.on_message = on_message      # callback(timestamp_ms, list_of_bytes)
+        self.last_high = None             # high 6 bits of last timestamp header
+        self.last_ts = None               # last full (unwrapped) timestamp
+
+    @classmethod
+    def unwrap(cls, prev, ts13):
+        """Unwrap a 13-bit timestamp against the previous one.
+
+        The field wraps every 8192 ms. Treat an apparent backwards jump as a
+        wrap: the true delta is always (ts13 - prev) mod 8192.
+        """
+        if prev is None:
+            return ts13
+        return prev + ((ts13 - prev) % cls.WRAP)
 
     def decode_packet(self, data):
         n = len(data)
@@ -175,34 +194,41 @@ class MidiParser:
                 i += 1
                 continue
             if self.last_high is None or i == 0:
-                self.last_high = b & 0x3F   # packet header
+                self.last_high = b & 0x3F   # packet header carries the high bits
                 i += 1
                 continue
             consumed = self._try_ts_and_message(data, i)
             if consumed:
                 i += consumed
             else:
-                self.last_high = b & 0x3F   # new header (rollover)
+                self.last_high = b & 0x3F   # new header (rollover mid-packet)
                 i += 1
 
     def _try_ts_and_message(self, data, i):
+        """Parse one message starting at data[i]=timestampLow.
+        Returns bytes consumed, or 0 if this position is actually a header."""
         n = len(data)
         if i + 1 >= n:
             return 0
+        ts_byte = data[i]                  # timestampLow (bit7=1)
+        ts13_abs = ((self.last_high & 0x3F) << 7) | (ts_byte & 0x7F)
+        ts = self.unwrap(self.last_ts, ts13_abs)
+
         status = data[i + 1]
         if not (status & 0x80):
             return 0                       # next byte is data -> was a header
 
         if status >= 0xF8:                 # system realtime: single byte
-            self._emit([status])
+            self._emit(ts, [status])
+            self.last_ts = ts
             return 2
 
-        if status in (0xF0, 0xF7):         # sysex
-            return self._parse_sysex(data, i)
+        if status in (0xF0, 0xF7):         # sysex start/continue
+            return self._parse_sysex(data, i, ts)
 
         hi = status & 0xF0
         length = MSG_LEN.get(hi)
-        if length is None:
+        if length is None:                 # system common F1/F2/F3
             length = SYS_COMMON_LEN.get(status)
             if length is None:
                 return 0
@@ -212,11 +238,13 @@ class MidiParser:
             return 0
         msg = [status] + list(data[i + 2:end])
         if any(d & 0x80 for d in msg[1:]):
-            return 0
-        self._emit(msg)
+            return 0                       # invalid data byte -> was a header
+        self._emit(ts, msg)
+        self.last_ts = ts
         return end - i
 
-    def _parse_sysex(self, data, i):
+    def _parse_sysex(self, data, i, ts):
+        """SysEx starting at data[i]=tsLow, data[i+1]=F0/F7."""
         out = []
         k = i + 2
         while k < len(data):
@@ -225,17 +253,18 @@ class MidiParser:
                 if b == 0xF7:
                     k += 1
                     break
-                if b >= 0xF8:
+                if b >= 0xF8:              # interleaved realtime
                     out.append(b); k += 1; continue
-                break
+                break                      # timestamps/headers -> outer loop
             out.append(b)
             k += 1
-        self._emit([data[i + 1]] + out)
+        self._emit(ts, [data[i + 1]] + out)
+        self.last_ts = ts
         return k - i
 
-    def _emit(self, msg):
+    def _emit(self, timestamp_ms, msg):
         try:
-            self.on_message(msg)
+            self.on_message(timestamp_ms, msg)
         except Exception as e:
             print("callback error:", e)
 
@@ -308,19 +337,42 @@ async def run(address=None, verbose=False):
     else:
         print("  WARNING: forwarding unavailable - monitor-only mode.")
 
+    # ---- paced forwarding queue (Method A: software pacing) -----------------
+    # BLE-MIDI timestamps are recovered by the parser and messages are fed to
+    # the forwarder preserving their relative timing: before each message we
+    # wait for the delta between its timestamp and the previous one's.
+    event_queue = asyncio.Queue()
+
+    def enqueue(ts_ms, msg):
+        event_queue.put_nowait((ts_ms, msg))
+
+    async def paced_forwarder():
+        """Drain the queue and forward messages honoring BLE-MIDI timestamps."""
+        prev_ts = None
+        max_catchup = 100          # ms; beyond this, flush without waiting
+        while True:
+            ts_ms, msg = await event_queue.get()
+            if prev_ts is not None:
+                delta = ts_ms - prev_ts
+                if 0 < delta <= max_catchup:
+                    await asyncio.sleep(delta / 1000.0)
+            ump = midi1_to_ump(msg)
+            if ump is not None:
+                fwd.send(ump)
+            prev_ts = ts_ms
+
     # ---- connect & listen --------------------------------------------------
     stats = {"packets": 0, "messages": 0}
     t0 = time.time()
+    first_ts = None
 
-    def sink(msg):
+    def sink(ts_ms, msg):
         stats["messages"] += 1
         rate = stats["messages"] / max(time.time() - t0, 1e-9)
         stamp = time.strftime("%H:%M:%S")
         hexs = " ".join(f"{b:02X}" for b in msg)
-        print(f"[{stamp}] {describe(msg):<46s} <{hexs}>  #{stats['messages']} ({rate:.0f}/s)")
-        ump = midi1_to_ump(msg)
-        if ump is not None:
-            fwd.send(ump)
+        print(f"[{stamp}] {describe(msg):<46s} <{hexs}>  #{stats['messages']} ({rate:.0f}/s) ts={ts_ms}")
+        enqueue(ts_ms, msg)
 
     parser = MidiParser(on_message=sink)
 
@@ -347,9 +399,13 @@ async def run(address=None, verbose=False):
                 "this device is not the Pico MIDI controller.")
 
         print("Connected! Listening for MIDI messages (Ctrl+C to stop)\n")
+        forwarder_task = asyncio.create_task(paced_forwarder())
         await client.start_notify(char, on_packet)
-        while True:
-            await asyncio.sleep(3600)
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            forwarder_task.cancel()
 
     except KeyboardInterrupt:
         pass

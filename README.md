@@ -100,7 +100,8 @@ Pico 2W ──BLE-MIDI──> ble_midi_receiver.py ──UMP──> Default App 
                                     DAW <── Default App Loopback (B) をMIDI入力に選択
 ```
 
-- BLE-MIDIパケットをデコード(タイムスタンプ、ランニングステータス、13ビットタイムスタンプの桁上がり=ヘッダ再挿入に対応)
+- BLE-MIDIパケットをデコード(ランニングステータス、13ビットタイムスタンプの桁上がり=ヘッダ再挿入に対応)
+- **タイムスタンパーシング**: 各MIDIメッセージに付与された13ビットBLE-MIDIタイムスタンプ(1ms分解能)を復元し、8192msのラップを補正。1つのBLEパケットに複数メッセージが圧縮されていた場合も、メッセージ間の相対的な時間差を保持したまま再生する(ソフトウェアペーシング方式)。急激な変化時に最大100msまでの遅延は即時フラッシュして追いつく
 - MIDI 1.0バイト列をUMP(Universal MIDI Packet)32bitワードに変換
 - PowerShellモジュール経由でDefault App Loopback (A)へ常時接続し、低遅延で転送
 

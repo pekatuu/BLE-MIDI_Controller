@@ -21,12 +21,14 @@ from ble_midi_receiver import MidiParser, describe
 
 def run():
     msgs = []
-    p = MidiParser(on_message=msgs.append)
+    p = MidiParser(on_message=lambda ts, m: msgs.append(m))
 
     def feed(hexstr):
-        msgs.clear()
-        p.decode_packet(bytearray.fromhex(hexstr))
-        return list(msgs)
+        got = []
+        orig = lambda ts, m: got.append(m)
+        q = MidiParser(on_message=orig)
+        q.decode_packet(bytearray.fromhex(hexstr))
+        return got
 
     failures = 0
 
@@ -54,7 +56,7 @@ def run():
         pkt.append(0x80 | (ts & 0x7F))
         pkt += bytes([0xB0, 7, v])
     p.decode_packet(pkt)
-    ok = [m[2] for m in msgs] == [1, 2, 3, 4]
+    ok = [m[1][2] if isinstance(m, tuple) else m[2] for m in msgs] == [1, 2, 3, 4]
     failures += 0 if ok else 1
     print("3 batch across rollover   :", "OK" if ok else "FAIL %s" % (msgs,))
 
